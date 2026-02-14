@@ -226,6 +226,25 @@ def _allocate_anima_budget(lengths: List[int], budget: int, base_index: int, min
     return alloc
 
 
+def _apply_anima_regional_overrides(
+    info: Dict[str, Any],
+    token_budget: int,
+    min_tokens_per_region: int,
+    base_min_tokens: int,
+):
+    if not isinstance(info, dict):
+        return
+
+    info["anima_token_budget"] = int(token_budget)
+    info["anima_min_tokens_per_region"] = int(min_tokens_per_region)
+
+    # Use -1 as UI sentinel for "auto" (do not override).
+    if int(base_min_tokens) >= 0:
+        info["anima_base_min_tokens"] = int(base_min_tokens)
+    else:
+        info.pop("anima_base_min_tokens", None)
+
+
 def _merge_anima_conditionings(cond, cond_list, base_index=-1):
     if not cond or not _is_conditioning_shape(cond):
         return
@@ -1432,6 +1451,9 @@ class ClownRegionalConditioning_AB:
                 "mask_type":               (REG_MASK_TYPE_AB,                            {"default": "boolean"}),
                 "edge_width":              ("INT",                                       {"default": 0,  "min": 0,          "max": 10000}),
                 "invert_mask":             ("BOOLEAN",                                   {"default": False}),
+                "anima_token_budget":      ("INT",                                       {"default": 0,  "min": -1,         "max": 8192}),
+                "anima_min_tokens_per_region": ("INT",                                   {"default": 8,  "min": 0,          "max": 2048}),
+                "anima_base_min_tokens":   ("INT",                                       {"default": -1, "min": -1,         "max": 8192}),
             }, 
             "optional": {
                 "conditioning_A":          ("CONDITIONING", ),
@@ -1472,7 +1494,10 @@ class ClownRegionalConditioning_AB:
             edge_width               : int    = 0,
             mask_A                            = None,
             mask_B                            = None,
-            invert_mask              : bool   = False
+            invert_mask              : bool   = False,
+            anima_token_budget       : int    = 0,
+            anima_min_tokens_per_region: int  = 8,
+            anima_base_min_tokens    : int    = -1,
             ) -> Tuple[Tensor]:
         
         mask   = mask_A
@@ -1498,6 +1523,9 @@ class ClownRegionalConditioning_AB:
                                         invert_mask              = invert_mask,
                                         conditioning_A           = conditioning_A,
                                         conditioning_B           = conditioning_B,
+                                        anima_token_budget       = anima_token_budget,
+                                        anima_min_tokens_per_region = anima_min_tokens_per_region,
+                                        anima_base_min_tokens    = anima_base_min_tokens,
                                         )
 
         cond = zero_conditioning_from_list([conditioning_A, conditioning_B])
@@ -1527,6 +1555,9 @@ class ClownRegionalConditioning_AB:
                                 mask                              = None,
                                 unmask                            = None,
                                 invert_mask              : bool   = False,
+                                anima_token_budget       : int    = 0,
+                                anima_min_tokens_per_region: int  = 8,
+                                anima_base_min_tokens    : int    = -1,
                                 ) -> Tuple[Tensor]:
 
         default_dtype  = torch.float64
@@ -1617,6 +1648,12 @@ class ClownRegionalConditioning_AB:
             cond[0][1]['RegContext'] = RegContext
             
             if _is_anima_model(model):
+                _apply_anima_regional_overrides(
+                    cond[0][1],
+                    token_budget=anima_token_budget,
+                    min_tokens_per_region=anima_min_tokens_per_region,
+                    base_min_tokens=anima_base_min_tokens,
+                )
                 _merge_anima_conditionings(cond, [conditioning_A, conditioning_B], base_index=1)
             else:
                 cond = merge_with_base(base=cond, others=[conditioning_A, conditioning_B])
@@ -1658,6 +1695,9 @@ class ClownRegionalConditioning_ABC:
                 "mask_type":               (REG_MASK_TYPE_ABC,                           {"default": "boolean"}),
                 "edge_width":              ("INT",                                       {"default": 0,    "min": 0,        "max": 10000}),
                 "invert_mask":             ("BOOLEAN",                                   {"default": False}),
+                "anima_token_budget":      ("INT",                                       {"default": 0,    "min": -1,       "max": 8192}),
+                "anima_min_tokens_per_region": ("INT",                                   {"default": 8,    "min": 0,        "max": 2048}),
+                "anima_base_min_tokens":   ("INT",                                       {"default": -1,   "min": -1,       "max": 8192}),
             }, 
             "optional": {
                 "conditioning_A":          ("CONDITIONING", ),
@@ -1703,7 +1743,10 @@ class ClownRegionalConditioning_ABC:
             mask_A                              = None,
             mask_B                              = None,
             mask_C                              = None,
-            invert_mask              : bool   = False
+            invert_mask              : bool   = False,
+            anima_token_budget       : int    = 0,
+            anima_min_tokens_per_region: int  = 8,
+            anima_base_min_tokens    : int    = -1,
             ) -> Tuple[Tensor]:
 
         if end_step == -1:
@@ -1728,6 +1771,9 @@ class ClownRegionalConditioning_ABC:
                                         conditioning_A           = conditioning_A,
                                         conditioning_B           = conditioning_B,
                                         conditioning_C           = conditioning_C,
+                                        anima_token_budget       = anima_token_budget,
+                                        anima_min_tokens_per_region = anima_min_tokens_per_region,
+                                        anima_base_min_tokens    = anima_base_min_tokens,
                                         )
 
         cond = zero_conditioning_from_list([conditioning_A, conditioning_B, conditioning_C])
@@ -1761,6 +1807,9 @@ class ClownRegionalConditioning_ABC:
                                 mask_B                            = None,
                                 mask_C                            = None,
                                 invert_mask              : bool   = False,
+                                anima_token_budget       : int    = 0,
+                                anima_min_tokens_per_region: int  = 8,
+                                anima_base_min_tokens    : int    = -1,
                                 ) -> Tuple[Tensor]:
 
         default_dtype  = torch.float64
@@ -1862,6 +1911,12 @@ class ClownRegionalConditioning_ABC:
             conditioning[0][1]['RegContext'] = RegContext
             
             if _is_anima_model(model):
+                _apply_anima_regional_overrides(
+                    conditioning[0][1],
+                    token_budget=anima_token_budget,
+                    min_tokens_per_region=anima_min_tokens_per_region,
+                    base_min_tokens=anima_base_min_tokens,
+                )
                 _merge_anima_conditionings(conditioning, [conditioning_A, conditioning_B, conditioning_C], base_index=2)
             else:
                 conditioning = merge_with_base(base=conditioning, others=[conditioning_A, conditioning_B, conditioning_C])
@@ -1895,6 +1950,9 @@ class ClownRegionalConditioning2(ClownRegionalConditioning_AB):
                 "mask_type":               (REG_MASK_TYPE_2,                             {"default": "boolean"}),
                 "edge_width":              ("INT",                                       {"default": 0,  "min": -10000,          "max": 10000}),
                 "invert_mask":             ("BOOLEAN",                                   {"default": False}),
+                "anima_token_budget":      ("INT",                                       {"default": 0,  "min": -1,             "max": 8192}),
+                "anima_min_tokens_per_region": ("INT",                                   {"default": 8,  "min": 0,              "max": 2048}),
+                "anima_base_min_tokens":   ("INT",                                       {"default": -1, "min": -1,             "max": 8192}),
             }, 
             "optional": {
                 "conditioning_masked":     ("CONDITIONING", ),
@@ -1930,6 +1988,9 @@ class ClownRegionalConditioning3(ClownRegionalConditioning_ABC):
                 "mask_type":               (REG_MASK_TYPE_3,                             {"default": "boolean"}),
                 "edge_width":              ("INT",                                       {"default": 0,    "min": 0,        "max": 10000}),
                 "invert_mask":             ("BOOLEAN",                                   {"default": False}),
+                "anima_token_budget":      ("INT",                                       {"default": 0,    "min": -1,       "max": 8192}),
+                "anima_min_tokens_per_region": ("INT",                                   {"default": 8,    "min": 0,        "max": 2048}),
+                "anima_base_min_tokens":   ("INT",                                       {"default": -1,   "min": -1,       "max": 8192}),
             },
             "optional": {
                 "conditioning_A":          ("CONDITIONING", ),
@@ -2027,6 +2088,9 @@ class ClownRegionalConditionings:
                 "end_step":                ("INT",                                       {"default": -1,  "min": -1,        "max": 10000}),
                 "mask_type":               (["gradient", "boolean"],                     {"default": "boolean"}),
                 "invert_masks":            ("BOOLEAN",                                   {"default": False}),
+                "anima_token_budget":      ("INT",                                       {"default": 0,   "min": -1,        "max": 8192}),
+                "anima_min_tokens_per_region": ("INT",                                   {"default": 8,   "min": 0,         "max": 2048}),
+                "anima_base_min_tokens":   ("INT",                                       {"default": -1,  "min": -1,        "max": 8192}),
             },
             "optional": {
                 "cond_regions":            ("COND_REGIONS", ),
@@ -2060,7 +2124,10 @@ class ClownRegionalConditionings:
             region_bleed             : float  = 0.0,
             region_bleed_start_step  : int    = 0,
             mask_type                : str    = "boolean",
-            invert_masks             : bool   = False
+            invert_masks             : bool   = False,
+            anima_token_budget       : int    = 0,
+            anima_min_tokens_per_region: int  = 8,
+            anima_base_min_tokens    : int    = -1,
             ) -> Tuple[Tensor]:
                 
         if end_step == -1:
@@ -2079,6 +2146,9 @@ class ClownRegionalConditionings:
                                         mask_type                = mask_type,
                                         invert_masks             = invert_masks,
                                         cond_regions             = cond_regions,
+                                        anima_token_budget       = anima_token_budget,
+                                        anima_min_tokens_per_region = anima_min_tokens_per_region,
+                                        anima_base_min_tokens    = anima_base_min_tokens,
                                         )
 
         cond_list = [region['conditioning'] for region in cond_regions]
@@ -2105,6 +2175,9 @@ class ClownRegionalConditionings:
                                 mask_type                : str    = "gradient",
                                 cond_regions                      = None,
                                 invert_masks             : bool   = False,
+                                anima_token_budget       : int    = 0,
+                                anima_min_tokens_per_region: int  = 8,
+                                anima_base_min_tokens    : int    = -1,
                                 ) -> Tuple[Tensor]:
 
         default_dtype  = torch.float64
@@ -2184,6 +2257,12 @@ class ClownRegionalConditionings:
         conditioning[0][1]['RegParam']   = RegionalParameters(weights, floors)
         
         if _is_anima_model(model):
+            _apply_anima_regional_overrides(
+                conditioning[0][1],
+                token_budget=anima_token_budget,
+                min_tokens_per_region=anima_min_tokens_per_region,
+                base_min_tokens=anima_base_min_tokens,
+            )
             base_index = _guess_anima_base_index_from_masks(mask_list, fallback=len(cond_list) - 1)
             _merge_anima_conditionings(conditioning, cond_list, base_index=base_index)
         else:
