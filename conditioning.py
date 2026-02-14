@@ -108,6 +108,18 @@ def _read_anima_env_int(info: dict, key: str, env_key: str, default: int) -> int
         return int(default)
 
 
+def _read_anima_env_int_optional(info: dict, key: str, env_key: str) -> Optional[int]:
+    value = info.get(key, None)
+    if value is None:
+        value = os.environ.get(env_key, None)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
 def _allocate_anima_budget(lengths: List[int], budget: int, base_index: int, min_region: int, base_min: int) -> List[int]:
     lengths = [max(int(v), 0) for v in lengths]
     n = len(lengths)
@@ -181,20 +193,9 @@ def _merge_anima_conditionings(cond, cond_list, base_index=-1):
         return
 
     info = cond[0][1] if len(cond[0]) > 1 and isinstance(cond[0][1], dict) else {}
-    token_budget = _read_anima_env_int(info, "anima_token_budget", "RES4LYF_ANIMA_TOKEN_BUDGET", 0)
-
-    # Default path: keep currently validated behavior unchanged.
-    if token_budget <= 0:
-        _concat_anima_conditioning_tokens(cond, cond_list)
-        _merge_anima_text_metadata(cond, cond_list)
-        _set_anima_base_context_span(cond, cond_list, base_index=base_index)
-        return
 
     min_region = _read_anima_env_int(info, "anima_min_tokens_per_region", "RES4LYF_ANIMA_MIN_TOKENS_PER_REGION", 8)
-    base_min = _read_anima_env_int(info, "anima_base_min_tokens", "RES4LYF_ANIMA_BASE_MIN_TOKENS", 192)
     min_region = max(min_region, 0)
-    base_min = max(base_min, 0)
-    token_budget = max(token_budget, 1)
 
     tokens_list: List[torch.Tensor] = []
     ids_list: List[torch.Tensor] = []
@@ -229,6 +230,39 @@ def _merge_anima_conditionings(cond, cond_list, base_index=-1):
         base_index += n
     base_index = min(max(base_index, 0), n - 1)
 
+    explicit_budget = _read_anima_env_int_optional(info, "anima_token_budget", "RES4LYF_ANIMA_TOKEN_BUDGET")
+    context_cap = _read_anima_env_int_optional(info, "anima_context_token_cap", "RES4LYF_ANIMA_CONTEXT_TOKEN_CAP")
+    inferred_budget = 0
+    if isinstance(context_cap, int) and context_cap > 0:
+        inferred_budget = int(context_cap)
+    elif isinstance(cond[0][0], torch.Tensor):
+        inferred_budget = int(cond[0][0].shape[-2])
+    elif len(lengths) > 0:
+        inferred_budget = max(lengths)
+    inferred_budget = max(int(inferred_budget), 1)
+
+    token_budget = int(explicit_budget) if explicit_budget is not None else inferred_budget
+
+    # Legacy opt-out path for troubleshooting only.
+    if token_budget < 0:
+        _concat_anima_conditioning_tokens(cond, cond_list)
+        _merge_anima_text_metadata(cond, cond_list)
+        _set_anima_base_context_span(cond, cond_list, base_index=base_index)
+        cond[0][1]["anima_token_budget"] = int(token_budget)
+        cond[0][1]["anima_context_len_raw"] = int(sum(lengths))
+        cond[0][1]["anima_context_len_used"] = int(sum(lengths))
+        RESplain("Anima regional token budgeting disabled (legacy concat path).", "warning")
+        return
+
+    # Treat explicit zero as "use inferred safe default", not "disable".
+    if token_budget == 0:
+        token_budget = inferred_budget
+
+    token_budget = max(token_budget, 1)
+    base_min_default = min(max(token_budget // 3, 64), token_budget)
+    base_min = _read_anima_env_int(info, "anima_base_min_tokens", "RES4LYF_ANIMA_BASE_MIN_TOKENS", base_min_default)
+    base_min = max(base_min, 0)
+
     keep = _allocate_anima_budget(lengths, token_budget, base_index, min_region, base_min)
 
     trimmed_tokens = [tokens_list[i][..., :keep[i], :] for i in range(n) if keep[i] > 0]
@@ -259,6 +293,15 @@ def _merge_anima_conditionings(cond, cond_list, base_index=-1):
     cond[0][1]["anima_context_len_raw"] = int(sum(lengths))
     cond[0][1]["anima_context_len_used"] = int(sum(keep))
     cond[0][1]["anima_token_budget"] = int(token_budget)
+    cond[0][1]["anima_context_token_cap"] = int(inferred_budget)
+
+    raw_len = int(sum(lengths))
+    used_len = int(sum(keep))
+    if used_len < raw_len:
+        RESplain(
+            f"Anima regional context truncated: raw={raw_len}, used={used_len}, budget={token_budget}, base_kept={span_len}.",
+            "warning",
+        )
 
 
 def _is_conditioning_shape(cond):
