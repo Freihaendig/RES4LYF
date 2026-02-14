@@ -165,6 +165,16 @@ def _anima_attention_op(q, k, v, transformer_options=None, attn_kind="cross", fa
     if not torch.all(row_ok):
         mask = torch.where(row_ok, mask, torch.ones_like(mask))
 
+    # Build additive bias mask explicitly to avoid bool-mask semantic
+    # ambiguity and keep backend behavior deterministic.
+    q_dtype = q_attn.dtype if q_attn.dtype.is_floating_point else torch.float32
+    neg_inf = torch.finfo(q_dtype).min
+    mask_bias = torch.where(
+        mask.to(device=q_attn.device),
+        torch.zeros_like(mask, dtype=q_dtype, device=q_attn.device),
+        torch.full_like(mask, neg_inf, dtype=q_dtype, device=q_attn.device),
+    )
+
     # Blackwell + xformers currently fails when passing tensor attn_bias.
     # Force PyTorch SDPA path for masked regional attention.
     return comfy_attention_pytorch(
@@ -172,7 +182,7 @@ def _anima_attention_op(q, k, v, transformer_options=None, attn_kind="cross", fa
         k_attn,
         v_attn,
         q_attn.shape[1],
-        mask=mask.to(device=q_attn.device),
+        mask=mask_bias,
         skip_reshape=True,
         transformer_options=transformer_options,
     )
