@@ -142,7 +142,17 @@ def _allocate_anima_budget(lengths: List[int], budget: int, base_index: int, min
     if used > budget:
         alloc = [0] * n
         remaining = budget
+
+        # In tight budgets, keep a small base slice so fallback context
+        # does not disappear entirely.
+        if base_index in active and remaining > 0:
+            reserve = max(1, min(lengths[base_index], max(base_min, 1), remaining))
+            alloc[base_index] = reserve
+            remaining -= reserve
+
         for i in sorted(active, key=lambda j: lengths[j], reverse=True):
+            if i == base_index:
+                continue
             if remaining <= 0:
                 break
             alloc[i] = min(lengths[i], remaining)
@@ -232,13 +242,19 @@ def _merge_anima_conditionings(cond, cond_list, base_index=-1):
 
     explicit_budget = _read_anima_env_int_optional(info, "anima_token_budget", "RES4LYF_ANIMA_TOKEN_BUDGET")
     context_cap = _read_anima_env_int_optional(info, "anima_context_token_cap", "RES4LYF_ANIMA_CONTEXT_TOKEN_CAP")
+    default_context_cap = _read_anima_env_int(
+        info,
+        "anima_context_token_cap_default",
+        "RES4LYF_ANIMA_CONTEXT_TOKEN_CAP_DEFAULT",
+        512,
+    )
     inferred_budget = 0
     if isinstance(context_cap, int) and context_cap > 0:
         inferred_budget = int(context_cap)
-    elif isinstance(cond[0][0], torch.Tensor):
-        inferred_budget = int(cond[0][0].shape[-2])
+    elif default_context_cap > 0:
+        inferred_budget = int(default_context_cap)
     elif len(lengths) > 0:
-        inferred_budget = max(lengths)
+        inferred_budget = int(sum(lengths))
     inferred_budget = max(int(inferred_budget), 1)
 
     token_budget = int(explicit_budget) if explicit_budget is not None else inferred_budget
@@ -300,6 +316,11 @@ def _merge_anima_conditionings(cond, cond_list, base_index=-1):
     if used_len < raw_len:
         RESplain(
             f"Anima regional context truncated: raw={raw_len}, used={used_len}, budget={token_budget}, base_kept={span_len}.",
+            "warning",
+        )
+    if raw_len > 0 and span_len <= 0:
+        RESplain(
+            "Anima regional base context received 0 tokens after budgeting; increase token budget or lower per-region minimum.",
             "warning",
         )
 
