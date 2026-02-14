@@ -187,26 +187,30 @@ def _anima_attention_op(q, k, v, transformer_options=None, attn_kind="cross", fa
 
     q_dtype = q_attn.dtype if q_attn.dtype.is_floating_point else torch.float32
     mask_device = q_attn.device
+    force_mask = bool(transformer_options.get("_res4lyf_anima_force_mask", False))
+    weight = abs(_scalar_or_default(transformer_options.get("regional_conditioning_weight"), 0.0))
+    weight = 1.0 if force_mask else min(max(weight, 0.0), 1.0)
 
-    # Preserve soft regional mask strengths (gradient masks) instead of
-    # collapsing everything to bool. This lets regional weight/floor schedules
-    # affect Anima similarly to other model integrations.
     if mask.dtype == torch.bool:
-        allow = mask.to(device=mask_device, dtype=q_dtype)
+        mask_bool = mask.to(device=mask_device, dtype=torch.bool)
+        disallow_allow = torch.exp(torch.full(mask_bool.shape, -12.0 * weight, dtype=q_dtype, device=mask_device))
+        allow = torch.where(mask_bool, torch.ones_like(disallow_allow), disallow_allow)
     else:
         allow = torch.clamp(mask.to(device=mask_device, dtype=q_dtype), 0.0, 1.0)
+        if weight > 0.0:
+            allow = torch.pow(allow, 1.0 + 3.0 * weight)
+        if not force_mask and weight < 1.0:
+            allow = (1.0 - weight) + weight * allow
 
     floor = abs(_scalar_or_default(transformer_options.get("regional_conditioning_floor"), 0.0))
     floor = min(max(floor, 0.0), 1.0)
 
-    # Keep boolean masks hard for region separation; floor provides optional
-    # minimal bleed.
     if floor > 0.0:
         allow = torch.maximum(allow, torch.full_like(allow, floor))
     allow = torch.clamp(allow, 1e-6, 1.0)
 
-    mask_strength = abs(_scalar_or_default(transformer_options.get("_res4lyf_anima_mask_strength"), 4.0))
-    mask_strength = max(mask_strength, 1.0)
+    mask_strength = abs(_scalar_or_default(transformer_options.get("_res4lyf_anima_mask_strength"), 1.0))
+    mask_strength = max(mask_strength, 0.1)
     mask_bias = torch.log(allow) * mask_strength
 
     # Blackwell + xformers currently fails when passing tensor attn_bias.
@@ -1199,16 +1203,20 @@ class ReAnimaPatcherAdvanced:
 
         if attn_mask_obj is None:
             transformer_options.pop("_res4lyf_anima_attn_mask", None)
+            transformer_options.pop("_res4lyf_anima_force_mask", None)
             return context
 
         if weight == 0.0:
             base_mask = ReAnimaPatcherAdvanced._build_base_token_mask(attn_mask_obj, context, transformer_options)
             if base_mask is not None:
                 transformer_options["_res4lyf_anima_attn_mask"] = base_mask
+                transformer_options["_res4lyf_anima_force_mask"] = True
             else:
                 transformer_options.pop("_res4lyf_anima_attn_mask", None)
+                transformer_options.pop("_res4lyf_anima_force_mask", None)
             return context
 
+        transformer_options["_res4lyf_anima_force_mask"] = False
         attn_mask_obj.attn_mask_recast(context.dtype)
         attn_mask_pos = attn_mask_obj.get(weight=weight)
 
@@ -1247,6 +1255,10 @@ class ReAnimaPatcherAdvanced:
             transformer_options = {}
             kwargs["transformer_options"] = transformer_options
 
+        context_len_raw = kwargs.pop("anima_context_len_raw", None)
+        context_len_used = kwargs.pop("anima_context_len_used", None)
+        token_budget = kwargs.pop("anima_token_budget", None)
+
         base_context_start = kwargs.pop("anima_base_context_start", None)
         base_context_len = kwargs.pop("anima_base_context_len", None)
 
@@ -1265,6 +1277,30 @@ class ReAnimaPatcherAdvanced:
                 transformer_options["_res4lyf_anima_base_context_len"] = int(base_context_len)
             except Exception:
                 transformer_options.pop("_res4lyf_anima_base_context_len", None)
+
+        anima_debug = kwargs.pop("anima_debug", None)
+        if anima_debug is None:
+            anima_debug = os.environ.get("RES4LYF_ANIMA_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}
+
+        if anima_debug:
+            try:
+                debug_key = (
+                    int(context_len_raw) if context_len_raw is not None else -1,
+                    int(context_len_used) if context_len_used is not None else -1,
+                    int(token_budget) if token_budget is not None else -1,
+                    int(base_context_start) if base_context_start is not None else -1,
+                    int(base_context_len) if base_context_len is not None else -1,
+                )
+            except Exception:
+                debug_key = None
+
+            if debug_key is not None and getattr(self, "_res4lyf_anima_debug_key", None) != debug_key:
+                print(
+                    "(RES4LYF/Anima) token budget "
+                    f"raw={debug_key[0]} used={debug_key[1]} budget={debug_key[2]} "
+                    f"base_start={debug_key[3]} base_len={debug_key[4]}"
+                )
+                self._res4lyf_anima_debug_key = debug_key
 
         context = ReAnimaPatcherAdvanced._prepare_regional_context(context, transformer_options)
         return ReAnimaPatcherAdvanced.original_forward(self, x, timesteps, context, fps, padding_mask, **kwargs)
