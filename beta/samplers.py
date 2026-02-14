@@ -899,6 +899,21 @@ class SharkSampler:
                     if pos_cond_tmp[0][1] is not None: 
                         if 'callback_regional' in pos_cond_tmp[0][1]:
                             pos_cond_tmp = pos_cond_tmp[0][1]['callback_regional'](work_model)
+                            # Update the guider's stored conditioning so that
+                            # process_conds / extra_conds sees the REAL merged
+                            # conditioning (with correct t5xxl_ids, t5xxl_weights,
+                            # and concatenated context).  Without this, the guider
+                            # keeps the placeholder from zero_conditioning_from_list
+                            # which has all-zero token IDs and weights, causing the
+                            # LLM adapter to produce uniform blank embeddings.
+                            if guider is not None:
+                                if type(guider) == SharkGuider:
+                                    guider.set_conds(xt_positive=pos_cond_tmp, xt_negative=neg_cond)
+                                else:
+                                    try:
+                                        guider.set_conds(pos_cond_tmp, neg_cond)
+                                    except Exception:
+                                        pass
                         
                         if 'AttnMask' in pos_cond_tmp[0][1]:
                             sampler.extra_options['AttnMask']   = pos_cond_tmp[0][1]['AttnMask']
@@ -935,6 +950,16 @@ class SharkSampler:
                     if neg_cond[0][1] is not None: 
                         if 'callback_regional' in neg_cond[0][1]:
                             neg_cond = neg_cond[0][1]['callback_regional'](work_model)
+                            # Same fix as positive: update guider with the real
+                            # merged negative conditioning.
+                            if guider is not None:
+                                if type(guider) == SharkGuider:
+                                    guider.set_conds(xt_positive=pos_cond_tmp, xt_negative=neg_cond)
+                                else:
+                                    try:
+                                        guider.set_conds(pos_cond_tmp, neg_cond)
+                                    except Exception:
+                                        pass
                         
                         if 'AttnMask' in neg_cond[0][1]:
                             sampler.extra_options['AttnMask_neg']   = neg_cond[0][1]['AttnMask']
