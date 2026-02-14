@@ -1,6 +1,6 @@
 import torch
 import types
-from typing import Optional, Callable, Tuple, Dict, Any, Union, TYPE_CHECKING, TypeVar
+from typing import Optional, Callable, Tuple, Dict, Any, Union, TYPE_CHECKING, TypeVar, List
 import re
 
 import folder_paths
@@ -70,6 +70,92 @@ from .helper import parse_range_string
 from comfy.model_sampling import *
 
 ANIMA_MODEL_CLASS = getattr(comfy.supported_models, "Anima", None)
+try:
+    from comfy.ldm.anima.model import Anima as ANIMA_DIFFUSION_MODEL_CLASS
+except Exception:
+    ANIMA_DIFFUSION_MODEL_CLASS = None
+
+
+def _scalar_or_default(value, default=0.0):
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 0:
+            return default
+        return float(value.reshape(-1)[0].item())
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _slice_anima_mask_for_attention(mask: Optional[torch.Tensor], q_tokens: int, k_tokens: int, attn_kind: str):
+    if mask is None:
+        return None
+
+    while mask.ndim > 2 and mask.shape[0] == 1:
+        mask = mask.squeeze(0)
+
+    if mask.ndim != 2:
+        return None
+
+    rows, cols = mask.shape
+    sliced = None
+
+    if rows == q_tokens and cols == k_tokens:
+        sliced = mask
+    elif attn_kind == "cross":
+        if rows == q_tokens and cols >= k_tokens:
+            sliced = mask[:, :k_tokens]
+        elif rows >= q_tokens and cols == k_tokens:
+            sliced = mask[-q_tokens:, :]
+        elif rows >= q_tokens and cols >= k_tokens:
+            sliced = mask[-q_tokens:, :k_tokens]
+    else:
+        if rows == q_tokens and cols >= k_tokens:
+            sliced = mask[:, -k_tokens:]
+        elif rows >= q_tokens and cols == k_tokens:
+            sliced = mask[-q_tokens:, :]
+        elif rows >= q_tokens and cols >= k_tokens:
+            sliced = mask[-q_tokens:, -k_tokens:]
+
+    if sliced is None or sliced.shape[-2] != q_tokens or sliced.shape[-1] != k_tokens:
+        return None
+    return sliced
+
+
+def _anima_attention_op(q, k, v, transformer_options=None, attn_kind="cross", fallback_attn_op=None):
+    if transformer_options is None:
+        transformer_options = {}
+
+    mask = transformer_options.get("_res4lyf_anima_attn_mask")
+    mask = _slice_anima_mask_for_attention(mask, q.shape[1], k.shape[1], attn_kind)
+
+    if mask is None:
+        if fallback_attn_op is not None:
+            return fallback_attn_op(q, k, v, transformer_options=transformer_options)
+        q_ = q.permute(0, 2, 1, 3)
+        k_ = k.permute(0, 2, 1, 3)
+        v_ = v.permute(0, 2, 1, 3)
+        out = torch.nn.functional.scaled_dot_product_attention(q_, k_, v_)
+        return out.permute(0, 2, 1, 3)
+
+    if mask.dtype != torch.bool:
+        mask = mask > 0
+
+    # Avoid all-false rows, which produce undefined attention output.
+    row_ok = mask.any(dim=-1, keepdim=True)
+    if not torch.all(row_ok):
+        mask = torch.where(row_ok, mask, torch.ones_like(mask))
+
+    q_ = q.permute(0, 2, 1, 3)
+    k_ = k.permute(0, 2, 1, 3)
+    v_ = v.permute(0, 2, 1, 3)
+    mask = mask.to(device=q_.device).unsqueeze(0).unsqueeze(0)
+    out = torch.nn.functional.scaled_dot_product_attention(q_, k_, v_, attn_mask=mask)
+    return out.permute(0, 2, 1, 3)
 
 class PRED:
     TYPE_VP    = {CONST}
@@ -961,6 +1047,141 @@ class ReHiDreamPatcher(ReHiDreamPatcherAdvanced):
             force                = force
         )    
 
+
+
+class ReAnimaPatcherAdvanced:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "enable": ("BOOLEAN", {"default": True}),
+            }
+        }
+    RETURN_TYPES = ("MODEL",)
+    RETURN_NAMES = ("model",)
+    CATEGORY = "RES4LYF/model_patches"
+    FUNCTION = "main"
+
+    original_forward = ANIMA_DIFFUSION_MODEL_CLASS._forward if ANIMA_DIFFUSION_MODEL_CLASS is not None else None
+
+    @staticmethod
+    def _supports_anima(model):
+        if ANIMA_MODEL_CLASS is None or ANIMA_DIFFUSION_MODEL_CLASS is None:
+            return False
+        if not isinstance(model.model.model_config, ANIMA_MODEL_CLASS):
+            return False
+        return hasattr(model.model.diffusion_model, "blocks")
+
+    @staticmethod
+    def _make_attn_op(attn_kind: str, fallback_attn_op):
+        def _wrapped(q, k, v, transformer_options={}):
+            return _anima_attention_op(
+                q=q,
+                k=k,
+                v=v,
+                transformer_options=transformer_options,
+                attn_kind=attn_kind,
+                fallback_attn_op=fallback_attn_op,
+            )
+        return _wrapped
+
+    @staticmethod
+    def _prepare_regional_context(context: torch.Tensor, transformer_options: Dict[str, Any]) -> torch.Tensor:
+        attn_mask_obj = transformer_options.get("AttnMask")
+        reg_context = transformer_options.get("RegContext")
+        weight = _scalar_or_default(transformer_options.get("regional_conditioning_weight"), 0.0)
+
+        if attn_mask_obj is None or reg_context is None or weight == 0.0:
+            transformer_options.pop("_res4lyf_anima_attn_mask", None)
+            return context
+
+        attn_mask_obj.attn_mask_recast(context.dtype)
+        transformer_options["_res4lyf_anima_attn_mask"] = attn_mask_obj.get(weight=weight)
+
+        region_context = reg_context.get().to(device=context.device, dtype=context.dtype)
+        cond_or_uncond = transformer_options.get("cond_or_uncond")
+
+        if isinstance(cond_or_uncond, (list, tuple)) and len(cond_or_uncond) == context.shape[0]:
+            mixed_context: List[torch.Tensor] = []
+            for batch_index, cond_flag in enumerate(cond_or_uncond):
+                if int(cond_flag) == 1:
+                    base = context[batch_index:batch_index + 1]
+                    repeated = base.repeat(1, (region_context.shape[1] // base.shape[1]) + 1, 1)
+                    mixed_context.append(repeated[:, :region_context.shape[1], :])
+                else:
+                    mixed_context.append(region_context)
+            return torch.cat(mixed_context, dim=0)
+
+        if region_context.shape[0] == 1 and context.shape[0] > 1:
+            return region_context.repeat(context.shape[0], 1, 1)
+        return region_context
+
+    @staticmethod
+    def _forward_with_regional(self, x, timesteps, context, fps=None, padding_mask=None, **kwargs):
+        transformer_options = kwargs.get("transformer_options", {})
+        if transformer_options is None:
+            transformer_options = {}
+            kwargs["transformer_options"] = transformer_options
+
+        context = ReAnimaPatcherAdvanced._prepare_regional_context(context, transformer_options)
+        return ReAnimaPatcherAdvanced.original_forward(self, x, timesteps, context, fps, padding_mask, **kwargs)
+
+    def main(self, model, enable=True, force=False):
+        if not self._supports_anima(model):
+            raise ValueError("This node is for enabling regional conditioning for Anima only!")
+
+        m = model.clone()
+        diffusion_model = m.model.diffusion_model
+
+        if enable or force:
+            diffusion_model._res4lyf_anima_regional_enabled = True
+            diffusion_model._forward = types.MethodType(ReAnimaPatcherAdvanced._forward_with_regional, diffusion_model)
+
+            for i, block in enumerate(diffusion_model.blocks):
+                block.idx = i
+                if hasattr(block, "self_attn"):
+                    if not hasattr(block.self_attn, "_res4lyf_original_attn_op"):
+                        block.self_attn._res4lyf_original_attn_op = block.self_attn.attn_op
+                    block.self_attn.attn_op = ReAnimaPatcherAdvanced._make_attn_op(
+                        "self",
+                        block.self_attn._res4lyf_original_attn_op,
+                    )
+                if hasattr(block, "cross_attn"):
+                    if not hasattr(block.cross_attn, "_res4lyf_original_attn_op"):
+                        block.cross_attn._res4lyf_original_attn_op = block.cross_attn.attn_op
+                    block.cross_attn.attn_op = ReAnimaPatcherAdvanced._make_attn_op(
+                        "cross",
+                        block.cross_attn._res4lyf_original_attn_op,
+                    )
+        else:
+            diffusion_model._res4lyf_anima_regional_enabled = False
+            if ReAnimaPatcherAdvanced.original_forward is not None:
+                diffusion_model._forward = types.MethodType(ReAnimaPatcherAdvanced.original_forward, diffusion_model)
+
+            for block in diffusion_model.blocks:
+                if hasattr(block, "self_attn") and hasattr(block.self_attn, "_res4lyf_original_attn_op"):
+                    block.self_attn.attn_op = block.self_attn._res4lyf_original_attn_op
+                if hasattr(block, "cross_attn") and hasattr(block.cross_attn, "_res4lyf_original_attn_op"):
+                    block.cross_attn.attn_op = block.cross_attn._res4lyf_original_attn_op
+
+            diffusion_model._res4lyf_anima_attn_mask = None
+
+        return (m,)
+
+
+class ReAnimaPatcher(ReAnimaPatcherAdvanced):
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "enable": ("BOOLEAN", {"default": True}),
+            }
+        }
+
+    def main(self, model, enable=True, force=False):
+        return super().main(model=model, enable=enable, force=force)
 
 
 class ReJointBlockNoMask(ReJointBlock):

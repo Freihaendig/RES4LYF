@@ -18,6 +18,44 @@ import gc
 ANIMA_MODEL_CLASS = getattr(comfy.supported_models, "Anima", None)
 
 
+def _is_anima_model(model):
+    return ANIMA_MODEL_CLASS is not None and isinstance(model.model.model_config, ANIMA_MODEL_CLASS)
+
+
+def _ensure_anima_regional_patcher(model):
+    if _is_anima_model(model) and not getattr(model.model.diffusion_model, "_res4lyf_anima_regional_enabled", False):
+        raise ValueError("Anima regional conditioning requires ReAnimaPatcher to be enabled on the model.")
+
+
+def _merge_anima_text_metadata(cond, cond_list):
+    if not cond or not _is_conditioning_shape(cond):
+        return
+
+    t5_ids = []
+    t5_weights = []
+
+    for c in cond_list:
+        if not c or not _is_conditioning_shape(c):
+            continue
+        info = c[0][1] if len(c[0]) > 1 and isinstance(c[0][1], dict) else {}
+        ids = info.get("t5xxl_ids")
+        weights = info.get("t5xxl_weights")
+        if isinstance(ids, torch.Tensor) and isinstance(weights, torch.Tensor):
+            t5_ids.append(ids)
+            t5_weights.append(weights)
+
+    if len(t5_ids) == len(cond_list) and len(t5_ids) > 0:
+        cond[0][1]["t5xxl_ids"] = torch.cat(t5_ids, dim=-1)
+        cond[0][1]["t5xxl_weights"] = torch.cat(t5_weights, dim=-1)
+    else:
+        cond[0][1].pop("t5xxl_ids", None)
+        cond[0][1].pop("t5xxl_weights", None)
+
+
+def _is_conditioning_shape(cond):
+    return isinstance(cond, list) and len(cond) > 0 and isinstance(cond[0], (list, tuple)) and len(cond[0]) > 0
+
+
 from .sigmas  import get_sigmas
 
 from .helper  import initialize_or_scale, precision_tool, get_res4lyf_scheduler_list, pad_tensor_list_to_max_len
@@ -747,6 +785,7 @@ class EmptyConditioningGenerator:
         else:
             return [[
                 torch.zeros((1, self.text_len_base, self.text_channels)),
+                {},
             ]]
 
     def get_empty_conditionings(self, count):
@@ -777,18 +816,27 @@ def zero_conditioning_from_list(conds):
     for cond in conds:
         if cond is not None:
             for i in range(len(cond)):
-                pooled = cond[i][1].get('pooled_output')
-                llama3 = cond[i][1].get('conditioning_llama3')
+                info = cond[i][1] if len(cond[i]) > 1 and isinstance(cond[i][1], dict) else {}
+                pooled = info.get('pooled_output')
+                llama3 = info.get('conditioning_llama3')
 
-                pooled_len = pooled.shape[-1] if pooled is not None else 1
-                llama3_shape = llama3.shape if llama3 is not None else (1, 32, 128, 4096)
+                cond_info = {}
+
+                if pooled is not None:
+                    cond_info["pooled_output"] = torch.zeros((1, pooled.shape[-1]), dtype=cond[i][0].dtype, device=cond[i][0].device)
+
+                if llama3 is not None:
+                    cond_info["conditioning_llama3"] = torch.zeros(llama3.shape, dtype=cond[i][0].dtype, device=cond[i][0].device)
+
+                for key, value in info.items():
+                    if key in {"pooled_output", "conditioning_llama3"}:
+                        continue
+                    if isinstance(value, torch.Tensor):
+                        cond_info[key] = torch.zeros_like(value)
 
                 cond_zero = [[
                     torch.zeros_like(cond[i][0]),
-                    {
-                        "pooled_output": torch.zeros((1, pooled_len), dtype=cond[i][0].dtype, device=cond[i][0].device),
-                        "conditioning_llama3": torch.zeros(llama3_shape, dtype=cond[i][0].dtype, device=cond[i][0].device),
-                    },
+                    cond_info,
                 ]]
 
             return cond_zero
@@ -1191,6 +1239,7 @@ class ClownRegionalConditioning_AB:
             conditioning_A, conditioning_B = EmptyCondGen.zero_none_conditionings_([conditioning_A, conditioning_B])
             
             cond = copy.deepcopy(conditioning_A)
+            _ensure_anima_regional_patcher(model)
             
             if isinstance(model.model.model_config, (comfy.supported_models.WAN21_T2V, comfy.supported_models.WAN21_I2V)):
                 if model.model.diffusion_model.blocks[0].self_attn.winderz_type != "false":
@@ -1199,7 +1248,7 @@ class ClownRegionalConditioning_AB:
                     AttnMask = SplitAttentionMask(mask_type, edge_width)
             elif isinstance(model.model.model_config, comfy.supported_models.HiDream):
                 AttnMask = FullAttentionMaskHiDream(mask_type, edge_width)
-            elif isinstance(model.model.model_config, (comfy.supported_models.SDXL, comfy.supported_models.SD15, comfy.supported_models.Stable_Cascade_C)):
+            elif isinstance(model.model.model_config, (comfy.supported_models.SDXL, comfy.supported_models.SD15, comfy.supported_models.Stable_Cascade_C)) or _is_anima_model(model):
                 AttnMask = SplitAttentionMask(mask_type, edge_width)
             else:
                 AttnMask = FullAttentionMask(mask_type, edge_width)
@@ -1244,6 +1293,8 @@ class ClownRegionalConditioning_AB:
             cond[0][1]['RegContext'] = RegContext
             
             cond = merge_with_base(base=cond, others=[conditioning_A, conditioning_B])
+            if _is_anima_model(model):
+                _merge_anima_text_metadata(cond, [conditioning_A, conditioning_B])
             
             if 'pooled_output' in cond[0][1] and cond[0][1]['pooled_output'] is not None:
                 cond[0][1]['pooled_output'] = (conditioning_A[0][1]['pooled_output'] + conditioning_B[0][1]['pooled_output']) / 2
@@ -1425,6 +1476,7 @@ class ClownRegionalConditioning_ABC:
             conditioning_A, conditioning_B, conditioning_C = EmptyCondGen.zero_none_conditionings_([conditioning_A, conditioning_B, conditioning_C])
 
             conditioning = copy.deepcopy(conditioning_A)
+            _ensure_anima_regional_patcher(model)
             
             if isinstance(model.model.model_config, (comfy.supported_models.WAN21_T2V, comfy.supported_models.WAN21_I2V)):
                 if model.model.diffusion_model.blocks[0].self_attn.winderz_type != "false":
@@ -1433,7 +1485,7 @@ class ClownRegionalConditioning_ABC:
                     AttnMask = SplitAttentionMask(mask_type, edge_width)
             elif isinstance(model.model.model_config, comfy.supported_models.HiDream):
                 AttnMask = FullAttentionMaskHiDream(mask_type, edge_width)
-            elif isinstance(model.model.model_config, (comfy.supported_models.SDXL, comfy.supported_models.SD15, comfy.supported_models.Stable_Cascade_C)):
+            elif isinstance(model.model.model_config, (comfy.supported_models.SDXL, comfy.supported_models.SD15, comfy.supported_models.Stable_Cascade_C)) or _is_anima_model(model):
                 AttnMask = SplitAttentionMask(mask_type, edge_width)
             else:
                 AttnMask = FullAttentionMask(mask_type, edge_width)
@@ -1482,6 +1534,8 @@ class ClownRegionalConditioning_ABC:
             conditioning[0][1]['RegContext'] = RegContext
             
             conditioning = merge_with_base(base=conditioning, others=[conditioning_A, conditioning_B, conditioning_C])
+            if _is_anima_model(model):
+                _merge_anima_text_metadata(conditioning, [conditioning_A, conditioning_B, conditioning_C])
             
             if 'pooled_output' in conditioning[0][1] and conditioning[0][1]['pooled_output'] is not None:
                 conditioning[0][1]['pooled_output'] = (conditioning_A[0][1]['pooled_output'] + conditioning_B[0][1]['pooled_output'] + conditioning_C[0][1]['pooled_output']) / 3
@@ -1757,6 +1811,7 @@ class ClownRegionalConditionings:
         cond_list = EmptyCondGen.zero_none_conditionings_(cond_list)
         
         conditioning = copy.deepcopy(cond_list[0])
+        _ensure_anima_regional_patcher(model)
         
         if isinstance(model.model.model_config, comfy.supported_models.WAN21_T2V) or isinstance(model.model.model_config, comfy.supported_models.WAN21_I2V):
             if model.model.diffusion_model.blocks[0].self_attn.winderz_type != "false":
@@ -1765,7 +1820,7 @@ class ClownRegionalConditionings:
                 AttnMask = SplitAttentionMask  (mask_type, edge_width_list=edge_width_list, use_self_attn_mask_list=use_self_attn_mask_list)
         elif isinstance(model.model.model_config, comfy.supported_models.HiDream):
             AttnMask = FullAttentionMaskHiDream(mask_type, edge_width_list=edge_width_list, use_self_attn_mask_list=use_self_attn_mask_list)
-        elif isinstance(model.model.model_config, comfy.supported_models.SDXL) or isinstance(model.model.model_config, comfy.supported_models.SD15):
+        elif isinstance(model.model.model_config, comfy.supported_models.SDXL) or isinstance(model.model.model_config, comfy.supported_models.SD15) or _is_anima_model(model):
             AttnMask = SplitAttentionMask(mask_type, edge_width_list=edge_width_list, use_self_attn_mask_list=use_self_attn_mask_list)
         else:
             AttnMask = FullAttentionMask       (mask_type, edge_width_list=edge_width_list, use_self_attn_mask_list=use_self_attn_mask_list)
@@ -1797,6 +1852,8 @@ class ClownRegionalConditionings:
         conditioning[0][1]['RegParam']   = RegionalParameters(weights, floors)
         
         conditioning = merge_with_base(base=conditioning, others=cond_list)
+        if _is_anima_model(model):
+            _merge_anima_text_metadata(conditioning, cond_list)
         
         if 'pooled_output' in conditioning[0][1] and conditioning[0][1]['pooled_output'] is not None:
             conditioning[0][1]['pooled_output'] = torch.stack([cond_tmp[0][1]['pooled_output'] for cond_tmp in cond_list]).mean(dim=0)

@@ -201,6 +201,7 @@ NODE_CLASS_MAPPINGS = {
     "ReAuraPatcher"                       : models.ReAuraPatcher,
     "ReLTXVPatcher"                       : models.ReLTXVPatcher,
     "ReHiDreamPatcher"                    : models.ReHiDreamPatcher,
+    "ReAnimaPatcher"                      : models.ReAnimaPatcher,
     "ReSDPatcher"                         : models.ReSDPatcher,
     "ReReduxPatcher"                      : models.ReReduxPatcher,
     
@@ -213,6 +214,7 @@ NODE_CLASS_MAPPINGS = {
 
     
     "ReHiDreamPatcherAdvanced"            : models.ReHiDreamPatcherAdvanced,
+    "ReAnimaPatcherAdvanced"              : models.ReAnimaPatcherAdvanced,
     
     "LayerPatcher"                        : loaders.LayerPatcher,
     
