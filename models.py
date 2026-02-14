@@ -196,13 +196,14 @@ def _anima_attention_op(q, k, v, transformer_options=None, attn_kind="cross", fa
     else:
         allow = torch.clamp(mask.to(device=mask_device, dtype=q_dtype), 0.0, 1.0)
 
+    weight = abs(_scalar_or_default(transformer_options.get("regional_conditioning_weight"), 1.0))
     floor = abs(_scalar_or_default(transformer_options.get("regional_conditioning_floor"), 0.0))
+    weight = min(max(weight, 0.0), 1.0)
     floor = min(max(floor, 0.0), 1.0)
 
-    # Keep boolean masks hard for region separation; floor provides optional
-    # minimal bleed.
-    if floor > 0.0:
-        allow = torch.maximum(allow, torch.full_like(allow, floor))
+    # Blend toward unmasked attention as weight approaches zero.
+    allow = floor + (1.0 - floor) * allow
+    allow = 1.0 - weight * (1.0 - allow)
     allow = torch.clamp(allow, 1e-6, 1.0)
 
     mask_strength = abs(_scalar_or_default(transformer_options.get("_res4lyf_anima_mask_strength"), 4.0))
@@ -1196,21 +1197,20 @@ class ReAnimaPatcherAdvanced:
         weight = _scalar_or_default(transformer_options.get("regional_conditioning_weight"), 0.0)
         weight_neg = _scalar_or_default(transformer_options.get("regional_conditioning_weight_neg"), 0.0)
         cond_or_uncond = transformer_options.get("cond_or_uncond")
+        keep_base_mask_when_weight_zero = str(
+            os.environ.get("RES4LYF_ANIMA_ZERO_WEIGHT_BASE_MASK", "0")
+        ).strip().lower() in {"1", "true", "yes", "on"}
 
-        if attn_mask_obj is None:
+        if attn_mask_obj is None and attn_mask_neg_obj is None:
             transformer_options.pop("_res4lyf_anima_attn_mask", None)
             return context
 
-        if weight == 0.0:
-            base_mask = ReAnimaPatcherAdvanced._build_base_token_mask(attn_mask_obj, context, transformer_options)
-            if base_mask is not None:
-                transformer_options["_res4lyf_anima_attn_mask"] = base_mask
-            else:
-                transformer_options.pop("_res4lyf_anima_attn_mask", None)
-            return context
-
-        attn_mask_obj.attn_mask_recast(context.dtype)
-        attn_mask_pos = attn_mask_obj.get(weight=weight)
+        attn_mask_pos = None
+        if attn_mask_obj is not None and weight != 0.0:
+            attn_mask_obj.attn_mask_recast(context.dtype)
+            attn_mask_pos = attn_mask_obj.get(weight=weight)
+        elif attn_mask_obj is not None and keep_base_mask_when_weight_zero:
+            attn_mask_pos = ReAnimaPatcherAdvanced._build_base_token_mask(attn_mask_obj, context, transformer_options)
 
         attn_mask_neg = None
         if attn_mask_neg_obj is not None and weight_neg != 0.0:
@@ -1237,7 +1237,12 @@ class ReAnimaPatcherAdvanced:
                 transformer_options.pop("_res4lyf_anima_attn_mask", None)
             return context
 
-        transformer_options["_res4lyf_anima_attn_mask"] = attn_mask_pos
+        if attn_mask_pos is not None:
+            transformer_options["_res4lyf_anima_attn_mask"] = attn_mask_pos
+        elif attn_mask_neg is not None:
+            transformer_options["_res4lyf_anima_attn_mask"] = attn_mask_neg
+        else:
+            transformer_options.pop("_res4lyf_anima_attn_mask", None)
         return context
 
     @staticmethod
