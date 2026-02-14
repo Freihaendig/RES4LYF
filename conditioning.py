@@ -1853,11 +1853,38 @@ def merge_with_base(
 
         toks = pad_tensor_list_to_max_len(toks, dim=dim)
         base_tokens = sum(toks)
+        token_dim = dim if dim >= 0 else base_tokens.ndim + dim
+        if token_dim < 0 or token_dim >= base_tokens.ndim:
+            token_dim = base_tokens.ndim - 1
+        token_len = base_tokens.shape[token_dim]
         base[lvl] = (base_tokens, base_info)
 
         # --- info-dict tensor merge ---
         for key, val in list(base_info.items()):
             if not isinstance(val, torch.Tensor):
+                continue
+
+            # Keep text-weight vectors aligned with merged token length.
+            # Anima/Qwen paths can otherwise fail in model_base.extra_conds
+            # when cross_attn length and t5xxl_weights length diverge.
+            if key == "t5xxl_weights":
+                source_tensor = None
+                for pos in others:
+                    if lvl < len(pos):
+                        info_i = pos[lvl][1]
+                        if key in info_i and isinstance(info_i[key], torch.Tensor):
+                            source_tensor = info_i[key]
+                            break
+                if source_tensor is None:
+                    source_tensor = val
+
+                weight_vec = source_tensor.to(device=base_tokens.device, dtype=base_tokens.dtype).reshape(-1)
+                if weight_vec.shape[0] > token_len:
+                    weight_vec = weight_vec[:token_len]
+                elif weight_vec.shape[0] < token_len:
+                    pad = torch.ones(token_len - weight_vec.shape[0], dtype=weight_vec.dtype, device=weight_vec.device)
+                    weight_vec = torch.cat((weight_vec, pad), dim=0)
+                base[lvl][1][key] = weight_vec
                 continue
 
             # Integer/bool metadata tensors (e.g. token ids) should not be
