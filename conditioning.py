@@ -52,6 +52,22 @@ def _merge_anima_text_metadata(cond, cond_list):
         cond[0][1].pop("t5xxl_weights", None)
 
 
+def _concat_anima_conditioning_tokens(cond, cond_list):
+    if not cond or not _is_conditioning_shape(cond):
+        return
+
+    token_tensors = []
+    for c in cond_list:
+        if c and _is_conditioning_shape(c) and isinstance(c[0][0], torch.Tensor):
+            token_tensors.append(c[0][0])
+
+    if not token_tensors:
+        return
+
+    info = cond[0][1] if len(cond[0]) > 1 and isinstance(cond[0][1], dict) else {}
+    cond[0] = (torch.cat(token_tensors, dim=-2), info)
+
+
 def _is_conditioning_shape(cond):
     return isinstance(cond, list) and len(cond) > 0 and isinstance(cond[0], (list, tuple)) and len(cond[0]) > 0
 
@@ -1292,9 +1308,11 @@ class ClownRegionalConditioning_AB:
             cond[0][1]['AttnMask'] = AttnMask
             cond[0][1]['RegContext'] = RegContext
             
-            cond = merge_with_base(base=cond, others=[conditioning_A, conditioning_B])
             if _is_anima_model(model):
+                _concat_anima_conditioning_tokens(cond, [conditioning_A, conditioning_B])
                 _merge_anima_text_metadata(cond, [conditioning_A, conditioning_B])
+            else:
+                cond = merge_with_base(base=cond, others=[conditioning_A, conditioning_B])
             
             if 'pooled_output' in cond[0][1] and cond[0][1]['pooled_output'] is not None:
                 cond[0][1]['pooled_output'] = (conditioning_A[0][1]['pooled_output'] + conditioning_B[0][1]['pooled_output']) / 2
@@ -1533,9 +1551,11 @@ class ClownRegionalConditioning_ABC:
             conditioning[0][1]['AttnMask']   = AttnMask
             conditioning[0][1]['RegContext'] = RegContext
             
-            conditioning = merge_with_base(base=conditioning, others=[conditioning_A, conditioning_B, conditioning_C])
             if _is_anima_model(model):
+                _concat_anima_conditioning_tokens(conditioning, [conditioning_A, conditioning_B, conditioning_C])
                 _merge_anima_text_metadata(conditioning, [conditioning_A, conditioning_B, conditioning_C])
+            else:
+                conditioning = merge_with_base(base=conditioning, others=[conditioning_A, conditioning_B, conditioning_C])
             
             if 'pooled_output' in conditioning[0][1] and conditioning[0][1]['pooled_output'] is not None:
                 conditioning[0][1]['pooled_output'] = (conditioning_A[0][1]['pooled_output'] + conditioning_B[0][1]['pooled_output'] + conditioning_C[0][1]['pooled_output']) / 3
@@ -1851,9 +1871,11 @@ class ClownRegionalConditionings:
         conditioning[0][1]['RegContext'] = RegContext
         conditioning[0][1]['RegParam']   = RegionalParameters(weights, floors)
         
-        conditioning = merge_with_base(base=conditioning, others=cond_list)
         if _is_anima_model(model):
+            _concat_anima_conditioning_tokens(conditioning, cond_list)
             _merge_anima_text_metadata(conditioning, cond_list)
+        else:
+            conditioning = merge_with_base(base=conditioning, others=cond_list)
         
         if 'pooled_output' in conditioning[0][1] and conditioning[0][1]['pooled_output'] is not None:
             conditioning[0][1]['pooled_output'] = torch.stack([cond_tmp[0][1]['pooled_output'] for cond_tmp in cond_list]).mean(dim=0)

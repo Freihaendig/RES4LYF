@@ -1139,13 +1139,11 @@ class ReAnimaPatcherAdvanced:
     def _prepare_regional_context(context: torch.Tensor, transformer_options: Dict[str, Any]) -> torch.Tensor:
         attn_mask_obj = transformer_options.get("AttnMask")
         attn_mask_neg_obj = transformer_options.get("AttnMask_neg")
-        reg_context = transformer_options.get("RegContext")
-        reg_context_neg = transformer_options.get("RegContext_neg")
         weight = _scalar_or_default(transformer_options.get("regional_conditioning_weight"), 0.0)
         weight_neg = _scalar_or_default(transformer_options.get("regional_conditioning_weight_neg"), 0.0)
         cond_or_uncond = transformer_options.get("cond_or_uncond")
 
-        if attn_mask_obj is None or reg_context is None or weight == 0.0:
+        if attn_mask_obj is None or weight == 0.0:
             transformer_options.pop("_res4lyf_anima_attn_mask", None)
             return context
 
@@ -1157,23 +1155,12 @@ class ReAnimaPatcherAdvanced:
             attn_mask_neg_obj.attn_mask_recast(context.dtype)
             attn_mask_neg = attn_mask_neg_obj.get(weight=weight_neg)
 
-        region_context = reg_context.get().to(device=context.device, dtype=context.dtype)
-        region_context_neg = None
-        if reg_context_neg is not None:
-            region_context_neg = reg_context_neg.get().to(device=context.device, dtype=context.dtype)
-
         if isinstance(cond_or_uncond, (list, tuple)) and len(cond_or_uncond) == context.shape[0]:
-            mixed_context: List[torch.Tensor] = []
             mixed_masks: List[Optional[torch.Tensor]] = []
             for batch_index, cond_flag in enumerate(cond_or_uncond):
                 if int(cond_flag) == 1:
-                    base = context[batch_index:batch_index + 1]
-                    target_context = region_context_neg if region_context_neg is not None else region_context
-                    repeated = base.repeat(1, (target_context.shape[1] // base.shape[1]) + 1, 1)
-                    mixed_context.append(repeated[:, :target_context.shape[1], :])
                     mixed_masks.append(attn_mask_neg)
                 else:
-                    mixed_context.append(region_context)
                     mixed_masks.append(attn_mask_pos)
 
             if any(mask is not None for mask in mixed_masks):
@@ -1188,13 +1175,10 @@ class ReAnimaPatcherAdvanced:
                 transformer_options["_res4lyf_anima_attn_mask"] = torch.stack(stacked, dim=0)
             else:
                 transformer_options.pop("_res4lyf_anima_attn_mask", None)
-            return torch.cat(mixed_context, dim=0)
+            return context
 
         transformer_options["_res4lyf_anima_attn_mask"] = attn_mask_pos
-
-        if region_context.shape[0] == 1 and context.shape[0] > 1:
-            return region_context.repeat(context.shape[0], 1, 1)
-        return region_context
+        return context
 
     @staticmethod
     def _forward_with_regional(self, x, timesteps, context, fps=None, padding_mask=None, **kwargs):
