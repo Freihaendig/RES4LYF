@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as F
 import math
+import os
 
 from torch  import Tensor
 from typing import Optional, Callable, Tuple, Dict, Any, Union, TYPE_CHECKING, TypeVar, List
@@ -95,6 +96,169 @@ def _set_anima_base_context_span(cond, cond_list, base_index=-1):
     span_len = int(lengths[idx])
     cond[0][1]["anima_base_context_start"] = start
     cond[0][1]["anima_base_context_len"] = span_len
+
+
+def _read_anima_env_int(info: dict, key: str, env_key: str, default: int) -> int:
+    value = info.get(key, None)
+    if value is None:
+        value = os.environ.get(env_key, None)
+    try:
+        return int(value)
+    except Exception:
+        return int(default)
+
+
+def _allocate_anima_budget(lengths: List[int], budget: int, base_index: int, min_region: int, base_min: int) -> List[int]:
+    lengths = [max(int(v), 0) for v in lengths]
+    n = len(lengths)
+    if n == 0 or budget <= 0:
+        return [0] * n
+    total = sum(lengths)
+    if total <= budget:
+        return lengths
+
+    if base_index < 0:
+        base_index += n
+    base_index = min(max(base_index, 0), n - 1)
+
+    alloc = [0] * n
+    active = [i for i, l in enumerate(lengths) if l > 0]
+    for i in active:
+        alloc[i] = min(lengths[i], max(min_region, 0))
+
+    used = sum(alloc)
+    if used > budget:
+        alloc = [0] * n
+        remaining = budget
+        for i in sorted(active, key=lambda j: lengths[j], reverse=True):
+            if remaining <= 0:
+                break
+            alloc[i] = min(lengths[i], remaining)
+            remaining -= alloc[i]
+        return alloc
+
+    remaining = budget - used
+    if remaining > 0 and lengths[base_index] > alloc[base_index]:
+        want = min(lengths[base_index], max(base_min, alloc[base_index]))
+        add = min(remaining, max(want - alloc[base_index], 0))
+        alloc[base_index] += add
+        remaining -= add
+
+    if remaining > 0:
+        residual = [max(lengths[i] - alloc[i], 0) for i in range(n)]
+        residual_total = sum(residual)
+        if residual_total > 0:
+            scaled = [remaining * residual[i] / residual_total for i in range(n)]
+            take = [min(residual[i], int(scaled[i])) for i in range(n)]
+            alloc = [alloc[i] + take[i] for i in range(n)]
+            remaining -= sum(take)
+
+            if remaining > 0:
+                order = sorted(
+                    range(n),
+                    key=lambda i: (scaled[i] - int(scaled[i]), residual[i] - take[i], i == base_index),
+                    reverse=True,
+                )
+                for i in order:
+                    if remaining <= 0:
+                        break
+                    if alloc[i] < lengths[i]:
+                        alloc[i] += 1
+                        remaining -= 1
+
+    if remaining > 0 and alloc[base_index] < lengths[base_index]:
+        add = min(remaining, lengths[base_index] - alloc[base_index])
+        alloc[base_index] += add
+        remaining -= add
+
+    return alloc
+
+
+def _merge_anima_conditionings(cond, cond_list, base_index=-1):
+    if not cond or not _is_conditioning_shape(cond):
+        return
+    if not isinstance(cond_list, (list, tuple)) or len(cond_list) == 0:
+        return
+
+    info = cond[0][1] if len(cond[0]) > 1 and isinstance(cond[0][1], dict) else {}
+    token_budget = _read_anima_env_int(info, "anima_token_budget", "RES4LYF_ANIMA_TOKEN_BUDGET", 0)
+
+    # Default path: keep currently validated behavior unchanged.
+    if token_budget <= 0:
+        _concat_anima_conditioning_tokens(cond, cond_list)
+        _merge_anima_text_metadata(cond, cond_list)
+        _set_anima_base_context_span(cond, cond_list, base_index=base_index)
+        return
+
+    min_region = _read_anima_env_int(info, "anima_min_tokens_per_region", "RES4LYF_ANIMA_MIN_TOKENS_PER_REGION", 8)
+    base_min = _read_anima_env_int(info, "anima_base_min_tokens", "RES4LYF_ANIMA_BASE_MIN_TOKENS", 192)
+    min_region = max(min_region, 0)
+    base_min = max(base_min, 0)
+    token_budget = max(token_budget, 1)
+
+    tokens_list: List[torch.Tensor] = []
+    ids_list: List[torch.Tensor] = []
+    weights_list: List[torch.Tensor] = []
+    lengths: List[int] = []
+    has_full_meta = True
+
+    for c in cond_list:
+        if not c or not _is_conditioning_shape(c) or not isinstance(c[0][0], torch.Tensor):
+            return
+        t = c[0][0]
+        c_info = c[0][1] if len(c[0]) > 1 and isinstance(c[0][1], dict) else {}
+        ids = c_info.get("t5xxl_ids")
+        wts = c_info.get("t5xxl_weights")
+        if isinstance(ids, torch.Tensor) and isinstance(wts, torch.Tensor):
+            ids = ids.reshape(-1)
+            wts = wts.reshape(-1)
+            aligned = min(int(t.shape[-2]), int(ids.shape[0]), int(wts.shape[0]))
+            lengths.append(aligned)
+            tokens_list.append(t[..., :aligned, :])
+            ids_list.append(ids[:aligned])
+            weights_list.append(wts[:aligned])
+        else:
+            has_full_meta = False
+            lengths.append(int(t.shape[-2]))
+            tokens_list.append(t)
+
+    n = len(lengths)
+    if n == 0:
+        return
+    if base_index < 0:
+        base_index += n
+    base_index = min(max(base_index, 0), n - 1)
+
+    keep = _allocate_anima_budget(lengths, token_budget, base_index, min_region, base_min)
+
+    trimmed_tokens = [tokens_list[i][..., :keep[i], :] for i in range(n) if keep[i] > 0]
+    if len(trimmed_tokens) == 0:
+        trimmed_tokens = [tokens_list[base_index][..., :1, :]]
+        keep = [0] * n
+        keep[base_index] = 1
+
+    cond[0] = (torch.cat(trimmed_tokens, dim=-2), info)
+
+    if has_full_meta and len(ids_list) == n and len(weights_list) == n:
+        trimmed_ids = [ids_list[i][:keep[i]] for i in range(n) if keep[i] > 0]
+        trimmed_wts = [weights_list[i][:keep[i]] for i in range(n) if keep[i] > 0]
+        if len(trimmed_ids) > 0 and len(trimmed_wts) > 0:
+            cond[0][1]["t5xxl_ids"] = torch.cat(trimmed_ids, dim=-1)
+            cond[0][1]["t5xxl_weights"] = torch.cat(trimmed_wts, dim=-1)
+        else:
+            cond[0][1].pop("t5xxl_ids", None)
+            cond[0][1].pop("t5xxl_weights", None)
+    else:
+        cond[0][1].pop("t5xxl_ids", None)
+        cond[0][1].pop("t5xxl_weights", None)
+
+    start = int(sum(keep[:base_index]))
+    span_len = int(keep[base_index])
+    cond[0][1]["anima_base_context_start"] = start
+    cond[0][1]["anima_base_context_len"] = span_len
+    cond[0][1]["anima_context_len_raw"] = int(sum(lengths))
+    cond[0][1]["anima_context_len_used"] = int(sum(keep))
+    cond[0][1]["anima_token_budget"] = int(token_budget)
 
 
 def _is_conditioning_shape(cond):
@@ -1338,9 +1502,7 @@ class ClownRegionalConditioning_AB:
             cond[0][1]['RegContext'] = RegContext
             
             if _is_anima_model(model):
-                _concat_anima_conditioning_tokens(cond, [conditioning_A, conditioning_B])
-                _merge_anima_text_metadata(cond, [conditioning_A, conditioning_B])
-                _set_anima_base_context_span(cond, [conditioning_A, conditioning_B], base_index=1)
+                _merge_anima_conditionings(cond, [conditioning_A, conditioning_B], base_index=1)
             else:
                 cond = merge_with_base(base=cond, others=[conditioning_A, conditioning_B])
             
@@ -1585,9 +1747,7 @@ class ClownRegionalConditioning_ABC:
             conditioning[0][1]['RegContext'] = RegContext
             
             if _is_anima_model(model):
-                _concat_anima_conditioning_tokens(conditioning, [conditioning_A, conditioning_B, conditioning_C])
-                _merge_anima_text_metadata(conditioning, [conditioning_A, conditioning_B, conditioning_C])
-                _set_anima_base_context_span(conditioning, [conditioning_A, conditioning_B, conditioning_C], base_index=2)
+                _merge_anima_conditionings(conditioning, [conditioning_A, conditioning_B, conditioning_C], base_index=2)
             else:
                 conditioning = merge_with_base(base=conditioning, others=[conditioning_A, conditioning_B, conditioning_C])
             
@@ -1909,9 +2069,7 @@ class ClownRegionalConditionings:
         conditioning[0][1]['RegParam']   = RegionalParameters(weights, floors)
         
         if _is_anima_model(model):
-            _concat_anima_conditioning_tokens(conditioning, cond_list)
-            _merge_anima_text_metadata(conditioning, cond_list)
-            _set_anima_base_context_span(conditioning, cond_list, base_index=len(cond_list)-1)
+            _merge_anima_conditionings(conditioning, cond_list, base_index=len(cond_list)-1)
         else:
             conditioning = merge_with_base(base=conditioning, others=cond_list)
         
