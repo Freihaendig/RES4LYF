@@ -899,6 +899,17 @@ class SharkSampler:
                     if pos_cond_tmp[0][1] is not None: 
                         if 'callback_regional' in pos_cond_tmp[0][1]:
                             pos_cond_tmp = pos_cond_tmp[0][1]['callback_regional'](work_model)
+                            # ── DIAGNOSTIC: verify callback_regional output ──
+                            _cr_tensor = pos_cond_tmp[0][0] if pos_cond_tmp and len(pos_cond_tmp[0]) > 0 else None
+                            _cr_dict   = pos_cond_tmp[0][1] if pos_cond_tmp and len(pos_cond_tmp[0]) > 1 else {}
+                            print(f"[RES4LYF callback_regional] pos_cond_tmp[0][0].shape={tuple(_cr_tensor.shape) if _cr_tensor is not None else None}")
+                            print(f"[RES4LYF callback_regional] dict keys: {list(_cr_dict.keys())}")
+                            _has_ids = 't5xxl_ids' in _cr_dict
+                            _has_wts = 't5xxl_weights' in _cr_dict
+                            print(f"[RES4LYF callback_regional] has t5xxl_ids={_has_ids}  has t5xxl_weights={_has_wts}")
+                            if _has_ids:
+                                print(f"[RES4LYF callback_regional] t5xxl_ids first 8: {_cr_dict['t5xxl_ids'].reshape(-1)[:8].tolist()}")
+                            # ── END DIAGNOSTIC ──
                             # Update the guider's stored conditioning so that
                             # process_conds / extra_conds sees the REAL merged
                             # conditioning (with correct t5xxl_ids, t5xxl_weights,
@@ -909,10 +920,13 @@ class SharkSampler:
                             if guider is not None:
                                 if type(guider) == SharkGuider:
                                     guider.set_conds(xt_positive=pos_cond_tmp, xt_negative=neg_cond)
+                                    print("[RES4LYF callback_regional] → guider.set_conds(SharkGuider) called")
                                 else:
                                     try:
                                         guider.set_conds(pos_cond_tmp, neg_cond)
+                                        print("[RES4LYF callback_regional] → guider.set_conds(generic) called")
                                     except Exception:
+                                        print("[RES4LYF callback_regional] → guider.set_conds FAILED")
                                         pass
                         
                         if 'AttnMask' in pos_cond_tmp[0][1]:
@@ -1064,6 +1078,24 @@ class SharkSampler:
                         etas_decay          = etas_cached
                         etas_substep_decay  = etas_substep_cached
                         unsample_etas_decay = unsample_etas
+                    # ── DIAGNOSTIC: dump guider's stored conds before sampling ──
+                    if hasattr(guider, 'original_conds'):
+                        for _ck, _cv in guider.original_conds.items():
+                            if isinstance(_cv, list) and len(_cv) > 0:
+                                _first = _cv[0]
+                                _mconds = _first.get('model_conds', {}) if isinstance(_first, dict) else {}
+                                _ca = _first.get('cross_attn', None) if isinstance(_first, dict) else None
+                                _ids = _mconds.get('t5xxl_ids', None)
+                                _wts = _mconds.get('t5xxl_weights', None)
+                                print(f"[RES4LYF pre-sample] guider.original_conds['{_ck}']:")
+                                print(f"  cross_attn shape: {tuple(_ca.shape) if hasattr(_ca, 'shape') else type(_ca)}")
+                                print(f"  has t5xxl_ids: {_ids is not None}  has t5xxl_weights: {_wts is not None}")
+                                if hasattr(_ca, 'shape') and _ca is not None:
+                                    print(f"  cross_attn norm: {_ca.float().norm().item():.4f}")
+                                if _ids is not None and hasattr(_ids, 'cond'):
+                                    _ids_t = _ids.cond
+                                    print(f"  t5xxl_ids first 8: {_ids_t.reshape(-1)[:8].tolist()}")
+                    # ── END DIAGNOSTIC ──
                     if isinstance(x_input, comfy.nested_tensor.NestedTensor):
                         samples = guider.sample(noise, x_input._copy(), sampler, sigmas, denoise_mask=noise_mask, callback=callback, disable_pbar=disable_pbar, seed=noise_seed)
                     else:

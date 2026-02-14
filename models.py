@@ -1333,6 +1333,18 @@ class ReAnimaPatcherAdvanced:
         transformer_options["_res4lyf_anima_block_counter"] = 0
 
         context = ReAnimaPatcherAdvanced._prepare_regional_context(context, transformer_options)
+        # ── DIAGNOSTIC: trace whether mask was set ──
+        _has_mask = "_res4lyf_anima_attn_mask" in transformer_options
+        _mask = transformer_options.get("_res4lyf_anima_attn_mask")
+        _mask_shape = tuple(_mask.shape) if _mask is not None else None
+        _weight = transformer_options.get("regional_conditioning_weight", 0.0)
+        _cou = transformer_options.get("cond_or_uncond")
+        if not hasattr(self, '_res4lyf_diag_count'):
+            self._res4lyf_diag_count = 0
+        self._res4lyf_diag_count += 1
+        if self._res4lyf_diag_count <= 4:
+            print(f"[RES4LYF _forward_with_regional] context={tuple(context.shape)}  has_mask={_has_mask}  mask_shape={_mask_shape}  weight={_weight}  cond_or_uncond={_cou}")
+        # ── END DIAGNOSTIC ──
         return ReAnimaPatcherAdvanced.original_forward(self, x, timesteps, context, fps, padding_mask, **kwargs)
 
     @staticmethod
@@ -1355,7 +1367,17 @@ class ReAnimaPatcherAdvanced:
             t5xxl_weights = kwargs.get('t5xxl_weights', None)
             splits = getattr(diffusion_model, '_res4lyf_anima_region_splits', None)
 
+            # ── DIAGNOSTIC: trace which path is taken ──
+            _embed_shape = tuple(text_embeds.shape) if text_embeds is not None else None
+            _ids_shape   = tuple(text_ids.shape) if text_ids is not None else None
+            _wt_shape    = tuple(t5xxl_weights.shape) if t5xxl_weights is not None else None
+            print(f"[RES4LYF _preprocess] splits={splits}  embed={_embed_shape}  ids={_ids_shape}  wt={_wt_shape}  kwargs_keys={list(kwargs.keys())}")
+            if text_ids is not None:
+                print(f"[RES4LYF _preprocess] first 8 token ids: {text_ids.reshape(-1)[:8].tolist()}")
+            # ── END DIAGNOSTIC ──
+
             if splits is None or len(splits) <= 1:
+                print("[RES4LYF _preprocess] → FALLBACK (no regional splits)")
                 return original_preprocess(text_embeds, text_ids, **kwargs)
 
             total_len = sum(splits)
@@ -1365,6 +1387,7 @@ class ReAnimaPatcherAdvanced:
             # Only apply when the concatenated lengths actually match what we
             # expect from the budget allocation.  Fall back gracefully.
             if total_len <= 0 or total_len != embed_len or total_len != ids_len:
+                print(f"[RES4LYF _preprocess] → FALLBACK (dim mismatch total={total_len} embed={embed_len} ids={ids_len})")
                 return original_preprocess(text_embeds, text_ids, **kwargs)
 
             # ── Build block-diagonal bool mask ────────────────────────────
@@ -1383,12 +1406,14 @@ class ReAnimaPatcherAdvanced:
             # Use the same mask for both self-attn (target_attention_mask)
             # and cross-attn (source_attention_mask) since both source and
             # target share the same per-region token layout.
+            print(f"[RES4LYF _preprocess] → CUSTOM path: block-diagonal mask {self_mask.shape}, calling llm_adapter")
             out = diffusion_model.llm_adapter(
                 text_embeds,
                 text_ids,
                 target_attention_mask=self_mask,
                 source_attention_mask=self_mask,
             )
+            print(f"[RES4LYF _preprocess]   adapter output shape: {tuple(out.shape)}, norm: {out.norm().item():.4f}")
             if t5xxl_weights is not None:
                 t5xxl_weights_expanded = t5xxl_weights
                 if t5xxl_weights_expanded.ndim == 1:
