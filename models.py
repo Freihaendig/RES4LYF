@@ -92,6 +92,26 @@ def _scalar_or_default(value, default=0.0):
         return default
 
 
+def _extract_anima_cross_attn_mask(mask: Optional[torch.Tensor], text_len: int, k_tokens: int) -> Optional[torch.Tensor]:
+    """Extract only the cross-attention columns from a SplitAttentionMask and
+    pad/trim to match the actual context length (k_tokens).  SplitAttentionMask
+    stores ``[cross_attn(img, text) | self_attn(img, img)]`` concatenated along
+    the last dimension.  Taking ``mask[:, :k_tokens]`` when k_tokens > text_len
+    would leak self-attention values into cross-attention positions, corrupting
+    the regional conditioning signal.  This helper avoids that by slicing to
+    ``text_len`` first, then zero-padding to ``k_tokens``."""
+    if mask is None or text_len <= 0:
+        return None
+    cross = mask[..., :text_len]                    # only genuine cross-attn cols
+    if cross.shape[-1] >= k_tokens:
+        return cross[..., :k_tokens]                # trim if context shrank
+    # pad remaining columns (adapter padding tokens) with zeros → blocked
+    pad_cols = k_tokens - cross.shape[-1]
+    pad_shape = list(cross.shape[:-1]) + [pad_cols]
+    pad = torch.zeros(*pad_shape, dtype=cross.dtype, device=cross.device)
+    return torch.cat([cross, pad], dim=-1)
+
+
 def _slice_anima_mask_for_attention(mask: Optional[torch.Tensor], q_tokens: int, k_tokens: int, attn_kind: str):
     if mask is None:
         return None
@@ -110,14 +130,14 @@ def _slice_anima_mask_for_attention(mask: Optional[torch.Tensor], q_tokens: int,
         sliced = mask
     elif attn_kind == "cross":
         if rows == q_tokens and cols >= k_tokens:
-            sliced = mask[:, :k_tokens]
+            sliced = mask[..., :k_tokens]
         elif rows >= q_tokens and cols == k_tokens:
             sliced = mask[-q_tokens:, :]
         elif rows >= q_tokens and cols >= k_tokens:
             sliced = mask[-q_tokens:, :k_tokens]
     else:
         if rows == q_tokens and cols >= k_tokens:
-            sliced = mask[:, -k_tokens:]
+            sliced = mask[..., -k_tokens:]
         elif rows >= q_tokens and cols == k_tokens:
             sliced = mask[-q_tokens:, :]
         elif rows >= q_tokens and cols >= k_tokens:
@@ -1205,17 +1225,29 @@ class ReAnimaPatcherAdvanced:
             transformer_options.pop("_res4lyf_anima_attn_mask", None)
             return context
 
+        k_tokens = context.shape[1]  # actual context length (post LLM-adapter / padding)
+
         attn_mask_pos = None
         if attn_mask_obj is not None and weight != 0.0:
             attn_mask_obj.attn_mask_recast(context.dtype)
-            attn_mask_pos = attn_mask_obj.get(weight=weight)
+            raw_mask = attn_mask_obj.get(weight=weight)
+            text_len = getattr(attn_mask_obj, "text_len", 0)
+            if text_len > 0 and raw_mask is not None and raw_mask.shape[-1] != k_tokens:
+                attn_mask_pos = _extract_anima_cross_attn_mask(raw_mask, text_len, k_tokens)
+            else:
+                attn_mask_pos = raw_mask
         elif attn_mask_obj is not None and keep_base_mask_when_weight_zero:
             attn_mask_pos = ReAnimaPatcherAdvanced._build_base_token_mask(attn_mask_obj, context, transformer_options)
 
         attn_mask_neg = None
         if attn_mask_neg_obj is not None and weight_neg != 0.0:
             attn_mask_neg_obj.attn_mask_recast(context.dtype)
-            attn_mask_neg = attn_mask_neg_obj.get(weight=weight_neg)
+            raw_mask_neg = attn_mask_neg_obj.get(weight=weight_neg)
+            text_len_neg = getattr(attn_mask_neg_obj, "text_len", 0)
+            if text_len_neg > 0 and raw_mask_neg is not None and raw_mask_neg.shape[-1] != k_tokens:
+                attn_mask_neg = _extract_anima_cross_attn_mask(raw_mask_neg, text_len_neg, k_tokens)
+            else:
+                attn_mask_neg = raw_mask_neg
 
         if isinstance(cond_or_uncond, (list, tuple)) and len(cond_or_uncond) == context.shape[0]:
             mixed_masks: List[Optional[torch.Tensor]] = []
