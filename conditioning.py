@@ -68,6 +68,16 @@ def _concat_anima_conditioning_tokens(cond, cond_list):
     cond[0] = (torch.cat(token_tensors, dim=-2), info)
 
 
+def _set_anima_base_context_len(cond, base_cond):
+    if not cond or not _is_conditioning_shape(cond):
+        return
+    if not base_cond or not _is_conditioning_shape(base_cond):
+        return
+    if not isinstance(base_cond[0][0], torch.Tensor):
+        return
+    cond[0][1]["anima_base_context_len"] = int(base_cond[0][0].shape[-2])
+
+
 def _is_conditioning_shape(cond):
     return isinstance(cond, list) and len(cond) > 0 and isinstance(cond[0], (list, tuple)) and len(cond[0]) > 0
 
@@ -1311,6 +1321,7 @@ class ClownRegionalConditioning_AB:
             if _is_anima_model(model):
                 _concat_anima_conditioning_tokens(cond, [conditioning_A, conditioning_B])
                 _merge_anima_text_metadata(cond, [conditioning_A, conditioning_B])
+                _set_anima_base_context_len(cond, conditioning_B)
             else:
                 cond = merge_with_base(base=cond, others=[conditioning_A, conditioning_B])
             
@@ -1554,6 +1565,7 @@ class ClownRegionalConditioning_ABC:
             if _is_anima_model(model):
                 _concat_anima_conditioning_tokens(conditioning, [conditioning_A, conditioning_B, conditioning_C])
                 _merge_anima_text_metadata(conditioning, [conditioning_A, conditioning_B, conditioning_C])
+                _set_anima_base_context_len(conditioning, conditioning_C)
             else:
                 conditioning = merge_with_base(base=conditioning, others=[conditioning_A, conditioning_B, conditioning_C])
             
@@ -1874,6 +1886,7 @@ class ClownRegionalConditionings:
         if _is_anima_model(model):
             _concat_anima_conditioning_tokens(conditioning, cond_list)
             _merge_anima_text_metadata(conditioning, cond_list)
+            _set_anima_base_context_len(conditioning, cond_list[-1] if len(cond_list) > 0 else conditioning)
         else:
             conditioning = merge_with_base(base=conditioning, others=cond_list)
         

@@ -1145,19 +1145,33 @@ class ReAnimaPatcherAdvanced:
         return _wrapped
 
     @staticmethod
-    def _build_base_token_mask(attn_mask_obj, context: torch.Tensor) -> Optional[torch.Tensor]:
-        context_lens = getattr(attn_mask_obj, "context_lens", None)
+    def _build_base_token_mask(attn_mask_obj, context: torch.Tensor, transformer_options: Optional[Dict[str, Any]] = None) -> Optional[torch.Tensor]:
         img_len = getattr(attn_mask_obj, "img_len", 0)
         t = getattr(attn_mask_obj, "t", 1)
-        if not context_lens or img_len <= 0:
-            return None
-
-        base_len = int(context_lens[0]) if len(context_lens) > 0 else 0
-        if base_len <= 0:
+        if img_len <= 0:
             return None
 
         k_tokens = context.shape[1]
-        keep = min(base_len, k_tokens)
+        base_len_hint = None
+        if transformer_options is not None:
+            base_len_hint = transformer_options.get("_res4lyf_anima_base_context_len")
+
+        if base_len_hint is None:
+            context_lens = getattr(attn_mask_obj, "context_lens", None)
+            if context_lens:
+                try:
+                    base_len_hint = max(int(v) for v in context_lens if int(v) > 0)
+                except Exception:
+                    base_len_hint = None
+
+        if base_len_hint is None:
+            keep = k_tokens
+        else:
+            try:
+                keep = min(max(int(base_len_hint), 1), k_tokens)
+            except Exception:
+                keep = k_tokens
+
         q_tokens = int(img_len * t)
         mask = torch.zeros((q_tokens, k_tokens), dtype=torch.bool, device=context.device)
         mask[:, :keep] = True
@@ -1176,7 +1190,7 @@ class ReAnimaPatcherAdvanced:
             return context
 
         if weight == 0.0:
-            base_mask = ReAnimaPatcherAdvanced._build_base_token_mask(attn_mask_obj, context)
+            base_mask = ReAnimaPatcherAdvanced._build_base_token_mask(attn_mask_obj, context, transformer_options)
             if base_mask is not None:
                 transformer_options["_res4lyf_anima_attn_mask"] = base_mask
             else:
@@ -1222,6 +1236,15 @@ class ReAnimaPatcherAdvanced:
         if transformer_options is None:
             transformer_options = {}
             kwargs["transformer_options"] = transformer_options
+
+        base_context_len = kwargs.get("anima_base_context_len")
+        if base_context_len is None:
+            transformer_options.pop("_res4lyf_anima_base_context_len", None)
+        else:
+            try:
+                transformer_options["_res4lyf_anima_base_context_len"] = int(base_context_len)
+            except Exception:
+                transformer_options.pop("_res4lyf_anima_base_context_len", None)
 
         context = ReAnimaPatcherAdvanced._prepare_regional_context(context, transformer_options)
         return ReAnimaPatcherAdvanced.original_forward(self, x, timesteps, context, fps, padding_mask, **kwargs)
