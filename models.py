@@ -14,6 +14,7 @@ import comfy.sampler_helpers
 import comfy.utils
 import comfy.model_management
 import comfy.supported_models
+from comfy.ldm.modules.attention import optimized_attention as comfy_optimized_attention
 
 from comfy.cli_args import args
 
@@ -126,21 +127,35 @@ def _slice_anima_mask_for_attention(mask: Optional[torch.Tensor], q_tokens: int,
     return sliced
 
 
+def _reshape_anima_qkv_for_attention(t: torch.Tensor) -> torch.Tensor:
+    # Match comfy.ldm.cosmos.predict2.torch_attention_op layout flattening:
+    # [B, ..., H, D] -> [B, H, S, D], where S is flattened sequence axes.
+    in_shape = t.shape
+    return t.movedim(-2, 1).reshape(in_shape[0], in_shape[-2], -1, in_shape[-1])
+
+
 def _anima_attention_op(q, k, v, transformer_options=None, attn_kind="cross", fallback_attn_op=None):
     if transformer_options is None:
         transformer_options = {}
 
+    q_attn = _reshape_anima_qkv_for_attention(q)
+    k_attn = _reshape_anima_qkv_for_attention(k)
+    v_attn = _reshape_anima_qkv_for_attention(v)
+
     mask = transformer_options.get("_res4lyf_anima_attn_mask")
-    mask = _slice_anima_mask_for_attention(mask, q.shape[1], k.shape[1], attn_kind)
+    mask = _slice_anima_mask_for_attention(mask, q_attn.shape[2], k_attn.shape[2], attn_kind)
 
     if mask is None:
         if fallback_attn_op is not None:
             return fallback_attn_op(q, k, v, transformer_options=transformer_options)
-        q_ = q.permute(0, 2, 1, 3)
-        k_ = k.permute(0, 2, 1, 3)
-        v_ = v.permute(0, 2, 1, 3)
-        out = torch.nn.functional.scaled_dot_product_attention(q_, k_, v_)
-        return out.permute(0, 2, 1, 3)
+        return comfy_optimized_attention(
+            q_attn,
+            k_attn,
+            v_attn,
+            q_attn.shape[1],
+            skip_reshape=True,
+            transformer_options=transformer_options,
+        )
 
     if mask.dtype != torch.bool:
         mask = mask > 0
@@ -150,12 +165,25 @@ def _anima_attention_op(q, k, v, transformer_options=None, attn_kind="cross", fa
     if not torch.all(row_ok):
         mask = torch.where(row_ok, mask, torch.ones_like(mask))
 
-    q_ = q.permute(0, 2, 1, 3)
-    k_ = k.permute(0, 2, 1, 3)
-    v_ = v.permute(0, 2, 1, 3)
-    mask = mask.to(device=q_.device).unsqueeze(0).unsqueeze(0)
-    out = torch.nn.functional.scaled_dot_product_attention(q_, k_, v_, attn_mask=mask)
-    return out.permute(0, 2, 1, 3)
+    # Use additive bias mask (0 / -inf) so all optimized_attention backends
+    # (including xformers) interpret masking consistently.
+    q_dtype = q_attn.dtype if q_attn.dtype.is_floating_point else torch.float32
+    neg_inf = torch.finfo(q_dtype).min
+    mask_bias = torch.where(
+        mask.to(device=q_attn.device),
+        torch.zeros_like(mask, dtype=q_dtype, device=q_attn.device),
+        torch.full_like(mask, neg_inf, dtype=q_dtype, device=q_attn.device),
+    )
+
+    return comfy_optimized_attention(
+        q_attn,
+        k_attn,
+        v_attn,
+        q_attn.shape[1],
+        mask=mask_bias,
+        skip_reshape=True,
+        transformer_options=transformer_options,
+    )
 
 class PRED:
     TYPE_VP    = {CONST}
