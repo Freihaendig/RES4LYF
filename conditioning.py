@@ -15,6 +15,8 @@ import comfy.supported_models
 import node_helpers
 import gc
 
+ANIMA_MODEL_CLASS = getattr(comfy.supported_models, "Anima", None)
+
 
 from .sigmas  import get_sigmas
 
@@ -710,6 +712,10 @@ class EmptyConditioningGenerator:
                 self.text_len_base = 128
                 self.text_channels = 4096
                 #self.pooled_len    = 1
+            elif ANIMA_MODEL_CLASS is not None and isinstance(self.model_config, ANIMA_MODEL_CLASS):
+                self.text_len_base = 512
+                self.text_channels = 1024
+                self.pooled_len    = 0
             else:
                 raise ValueError(f"Unknown model config: {type(self.model_config)}")
         elif conditioning is not None:

@@ -1174,7 +1174,7 @@ class ClownGuide_Style_Beta:
     CATEGORY     = "RES4LYF/sampler_extensions"
     DESCRIPTION  = "Transfer some visual aspects of style from a guide (reference) image. If nothing about style is specified in the prompt, it may just transfer the lighting and color scheme." + \
                 "If using CFG results in burn, or a very dark/bright image in the preview followed by a bad output, try duplicating and chaining this node, so that the guide may be applied to both positive and negative conditioning." + \
-                "Currently supported models: SD1.5, SDXL, Stable Cascade, SD3.5, AuraFlow, Flux, HiDream, WAN, and LTXV."
+                "Currently supported models: SD1.5, SDXL, Stable Cascade, SD3.5, AuraFlow, Flux, HiDream, WAN, LTXV, and Anima."
 
     def main(self,
             apply_to         = "all",

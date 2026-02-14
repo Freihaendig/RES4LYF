@@ -48,7 +48,7 @@ If these menus do not show up after restarting ComfyUI and refreshing the page (
 
 # NEW VERSION DOCUMENTATION
 
-I have prepared a detailed explanation of many of the concepts of sampling with exmaples in this workflow. There's also many tips, explanations of parameters, and all of the most important nodes are laid out for you to see. Some new workflow-enhancing tricks like "chainsamplers" are demonstrated, and **regional AND temporal prompting** are explained (supporting Flux, HiDream, SD3.5, AuraFlow, and WAN - you can even change the conditioning on a frame-by-frame basis!).
+I have prepared a detailed explanation of many of the concepts of sampling with exmaples in this workflow. There's also many tips, explanations of parameters, and all of the most important nodes are laid out for you to see. Some new workflow-enhancing tricks like "chainsamplers" are demonstrated, and **regional AND temporal prompting** are explained (supporting Flux, HiDream, SD3.5, AuraFlow, WAN, and Anima - you can even change the conditioning on a frame-by-frame basis!).
 
 [[example_workflows/intro to clownsampling.json
 ]((https://github.com/ClownsharkBatwing/RES4LYF/blob/main/example_workflows/intro%20to%20clownsampling.json))](https://github.com/ClownsharkBatwing/RES4LYF/blob/main/example_workflows/intro%20to%20clownsampling.json)
@@ -59,7 +59,7 @@ I have prepared a detailed explanation of many of the concepts of sampling with 
 
 # STYLE TRANSFER
 
-Supported models: HiDream, Flux, Chroma, AuraFlow, SD1.5, SDXL, SD3.5, Stable Cascade, LTXV, and WAN. Also supported: Stable Cascade (and UltraPixel) which has an excellent understanding of style (https://github.com/ClownsharkBatwing/UltraCascade).
+Supported models: HiDream, Flux, Chroma, AuraFlow, SD1.5, SDXL, SD3.5, Stable Cascade, LTXV, WAN, and Anima. Also supported: Stable Cascade (and UltraPixel) which has an excellent understanding of style (https://github.com/ClownsharkBatwing/UltraCascade).
 
 Currently, best results are with HiDream or Chroma, or Flux with a style lora (Flux Dev is very lacking with style knowledge). Include some mention of the style you wish to use in the prompt. (Try with the guide off to confirm the prompt is not doing the heavy lifting!)
 
@@ -87,7 +87,7 @@ For example, the prompt for the below was simply "a gritty illustration of a jap
 
 Unlimited zones! Over 10 zones have been used in one image before. 
 
-Currently supported models: HiDream, Flux, Chroma, SD3.5, SD1.5, SDXL, AuraFlow, and WAN.
+Currently supported models: HiDream, Flux, Chroma, SD3.5, SD1.5, SDXL, AuraFlow, WAN, and Anima.
 
 Masks can be drawn freely, or more traditional rigid ones may be used, such as in this example:
 

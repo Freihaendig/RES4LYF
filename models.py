@@ -13,6 +13,7 @@ import comfy.sample
 import comfy.sampler_helpers
 import comfy.utils
 import comfy.model_management
+import comfy.supported_models
 
 from comfy.cli_args import args
 
@@ -67,6 +68,8 @@ from .res4lyf import RESplain
 from .helper import parse_range_string
 
 from comfy.model_sampling import *
+
+ANIMA_MODEL_CLASS = getattr(comfy.supported_models, "Anima", None)
 
 class PRED:
     TYPE_VP    = {CONST}
@@ -1291,6 +1294,12 @@ class ModelSamplingAdvanced:
             timesteps = 1000
             sampling_base = comfy.model_sampling.ModelSamplingDiscreteFlow
             sampling_type = comfy.model_sampling.CONST
+
+        elif ANIMA_MODEL_CLASS is not None and isinstance(m.model.model_config, ANIMA_MODEL_CLASS):
+            self.multiplier = 1
+            timesteps = 1000
+            sampling_base = comfy.model_sampling.ModelSamplingDiscreteFlow
+            sampling_type = comfy.model_sampling.CONST
             
         if isinstance(m.model.model_config, comfy.supported_models.WAN21_T2V) or isinstance(m.model.model_config, comfy.supported_models.WAN21_I2V):
             self.multiplier = 1000
@@ -1400,6 +1409,12 @@ class ModelSamplingAdvancedResolution:
             
         elif isinstance(m.model.model_config, comfy.supported_models.HunyuanVideo):
             self.multiplier = 1000
+            timesteps = 1000
+            sampling_base = comfy.model_sampling.ModelSamplingDiscreteFlow
+            sampling_type = comfy.model_sampling.CONST
+
+        elif ANIMA_MODEL_CLASS is not None and isinstance(m.model.model_config, ANIMA_MODEL_CLASS):
+            self.multiplier = 1
             timesteps = 1000
             sampling_base = comfy.model_sampling.ModelSamplingDiscreteFlow
             sampling_type = comfy.model_sampling.CONST
