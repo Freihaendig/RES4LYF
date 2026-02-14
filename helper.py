@@ -393,16 +393,37 @@ def initialize_or_scale(tensor, value, steps):
 
 
 def pad_tensor_list_to_max_len(tensors: List[torch.Tensor], dim: int = -2) -> List[torch.Tensor]:
-    """Zero-pad each tensor in `tensors` along `dim` up to their common maximum length."""
-    max_len = max(t.shape[dim] for t in tensors)
-    padded = []
+    """
+    Zero-pad each tensor in `tensors` along `dim` up to their common maximum length.
+
+    Handles mixed-rank inputs by expanding lower-rank tensors with leading singleton dims.
+    If `dim` is out of range for the normalized rank, pads along the last dim.
+    """
+    if not tensors:
+        return tensors
+
+    normalized = []
+    target_ndim = max(max(t.ndim, 1) for t in tensors)
     for t in tensors:
-        cur = t.shape[dim]
+        if t.ndim == 0:
+            t = t.reshape(1)
+        while t.ndim < target_ndim:
+            t = t.unsqueeze(0)
+        normalized.append(t)
+
+    pad_dim = dim if dim >= 0 else target_ndim + dim
+    if pad_dim < 0 or pad_dim >= target_ndim:
+        pad_dim = target_ndim - 1
+
+    max_len = max(t.shape[pad_dim] for t in normalized)
+    padded = []
+    for t in normalized:
+        cur = t.shape[pad_dim]
         if cur < max_len:
             pad_shape = list(t.shape)
-            pad_shape[dim] = max_len - cur
+            pad_shape[pad_dim] = max_len - cur
             zeros = torch.zeros(*pad_shape, dtype=t.dtype, device=t.device)
-            t = torch.cat((t, zeros), dim=dim)
+            t = torch.cat((t, zeros), dim=pad_dim)
         padded.append(t)
     return padded
 
@@ -858,5 +879,4 @@ def get_max_dtype(device='cpu'):
         except (RuntimeError, TypeError):
             MAX_DTYPE = torch.float32
     return MAX_DTYPE
-
 
