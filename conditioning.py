@@ -1345,7 +1345,10 @@ class ClownRegionalConditioning_AB:
                 cond = merge_with_base(base=cond, others=[conditioning_A, conditioning_B])
             
             if 'pooled_output' in cond[0][1] and cond[0][1]['pooled_output'] is not None:
-                cond[0][1]['pooled_output'] = (conditioning_A[0][1]['pooled_output'] + conditioning_B[0][1]['pooled_output']) / 2
+                if _is_anima_model(model):
+                    cond[0][1]['pooled_output'] = conditioning_B[0][1]['pooled_output']
+                else:
+                    cond[0][1]['pooled_output'] = (conditioning_A[0][1]['pooled_output'] + conditioning_B[0][1]['pooled_output']) / 2
             
             #if 'conditioning_llama3' in cond[0][1] and cond[0][1]['conditioning_llama3'] is not None:
             #    cond[0][1]['conditioning_llama3'] = (conditioning_A[0][1]['conditioning_llama3'] + conditioning_B[0][1]['conditioning_llama3']) / 2
@@ -1589,7 +1592,10 @@ class ClownRegionalConditioning_ABC:
                 conditioning = merge_with_base(base=conditioning, others=[conditioning_A, conditioning_B, conditioning_C])
             
             if 'pooled_output' in conditioning[0][1] and conditioning[0][1]['pooled_output'] is not None:
-                conditioning[0][1]['pooled_output'] = (conditioning_A[0][1]['pooled_output'] + conditioning_B[0][1]['pooled_output'] + conditioning_C[0][1]['pooled_output']) / 3
+                if _is_anima_model(model):
+                    conditioning[0][1]['pooled_output'] = conditioning_C[0][1]['pooled_output']
+                else:
+                    conditioning[0][1]['pooled_output'] = (conditioning_A[0][1]['pooled_output'] + conditioning_B[0][1]['pooled_output'] + conditioning_C[0][1]['pooled_output']) / 3
             
         else:
             conditioning = conditioning_A
@@ -1910,7 +1916,10 @@ class ClownRegionalConditionings:
             conditioning = merge_with_base(base=conditioning, others=cond_list)
         
         if 'pooled_output' in conditioning[0][1] and conditioning[0][1]['pooled_output'] is not None:
-            conditioning[0][1]['pooled_output'] = torch.stack([cond_tmp[0][1]['pooled_output'] for cond_tmp in cond_list]).mean(dim=0)
+            if _is_anima_model(model):
+                conditioning[0][1]['pooled_output'] = cond_list[-1][0][1]['pooled_output']
+            else:
+                conditioning[0][1]['pooled_output'] = torch.stack([cond_tmp[0][1]['pooled_output'] for cond_tmp in cond_list]).mean(dim=0)
 
             #conditioning[0][1]['pooled_output'] = cond_list[0][0][1]['pooled_output']
 

@@ -196,15 +196,13 @@ def _anima_attention_op(q, k, v, transformer_options=None, attn_kind="cross", fa
     else:
         allow = torch.clamp(mask.to(device=mask_device, dtype=q_dtype), 0.0, 1.0)
 
-    weight = abs(_scalar_or_default(transformer_options.get("regional_conditioning_weight"), 1.0))
     floor = abs(_scalar_or_default(transformer_options.get("regional_conditioning_floor"), 0.0))
-    weight = min(max(weight, 0.0), 1.0)
     floor = min(max(floor, 0.0), 1.0)
 
-    # Floor opens a baseline attention path ("bleed"), then weight controls
-    # how strongly we pull toward regional masking vs fully-open attention.
-    allow = floor + (1.0 - floor) * allow
-    allow = 1.0 - weight * (1.0 - allow)
+    # Keep boolean masks hard for region separation; floor provides optional
+    # minimal bleed.
+    if floor > 0.0:
+        allow = torch.maximum(allow, torch.full_like(allow, floor))
     allow = torch.clamp(allow, 1e-6, 1.0)
 
     mask_strength = abs(_scalar_or_default(transformer_options.get("_res4lyf_anima_mask_strength"), 4.0))
