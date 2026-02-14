@@ -1348,11 +1348,15 @@ class ReAnimaPatcherAdvanced:
         """
         import torch.nn.functional as _F
 
-        def _preprocess(text_embeds, text_ids, t5xxl_weights=None):
+        def _preprocess(text_embeds, text_ids, **kwargs):
+            # Accept **kwargs so we forward exactly what extra_conds passes.
+            # Old ComfyUI sends t5xxl_weights=<tensor>; new ComfyUI (0.13+)
+            # removed the parameter entirely.
+            t5xxl_weights = kwargs.get('t5xxl_weights', None)
             splits = getattr(diffusion_model, '_res4lyf_anima_region_splits', None)
 
             if splits is None or len(splits) <= 1:
-                return original_preprocess(text_embeds, text_ids, t5xxl_weights)
+                return original_preprocess(text_embeds, text_ids, **kwargs)
 
             total_len = sum(splits)
             embed_len = text_embeds.shape[1] if text_embeds is not None else 0
@@ -1361,7 +1365,7 @@ class ReAnimaPatcherAdvanced:
             # Only apply when the concatenated lengths actually match what we
             # expect from the budget allocation.  Fall back gracefully.
             if total_len <= 0 or total_len != embed_len or total_len != ids_len:
-                return original_preprocess(text_embeds, text_ids, t5xxl_weights)
+                return original_preprocess(text_embeds, text_ids, **kwargs)
 
             # ── Build block-diagonal bool mask ────────────────────────────
             # True = attend, False = block.  Each region can only attend
