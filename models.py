@@ -123,6 +123,15 @@ def _slice_anima_mask_for_attention(mask: Optional[torch.Tensor], q_tokens: int,
         elif rows >= q_tokens and cols >= k_tokens:
             sliced = mask[-q_tokens:, -k_tokens:]
 
+    if sliced is not None and sliced.shape[-2] == q_tokens and sliced.shape[-1] < k_tokens:
+        # Anima text preprocessing can pad context length (e.g. to 512 tokens).
+        # Regional masks are built from pre-pad token lengths; pad mask columns
+        # so masking still applies instead of falling back to unmasked attention.
+        pad_cols = k_tokens - sliced.shape[-1]
+        pad_shape = list(sliced.shape[:-1]) + [pad_cols]
+        pad = torch.zeros(*pad_shape, dtype=sliced.dtype, device=sliced.device)
+        sliced = torch.cat([sliced, pad], dim=-1)
+
     if sliced is None or sliced.shape[-2] != q_tokens or sliced.shape[-1] != k_tokens:
         return None
     return sliced
@@ -1136,6 +1145,25 @@ class ReAnimaPatcherAdvanced:
         return _wrapped
 
     @staticmethod
+    def _build_base_token_mask(attn_mask_obj, context: torch.Tensor) -> Optional[torch.Tensor]:
+        context_lens = getattr(attn_mask_obj, "context_lens", None)
+        img_len = getattr(attn_mask_obj, "img_len", 0)
+        t = getattr(attn_mask_obj, "t", 1)
+        if not context_lens or img_len <= 0:
+            return None
+
+        base_len = int(context_lens[0]) if len(context_lens) > 0 else 0
+        if base_len <= 0:
+            return None
+
+        k_tokens = context.shape[1]
+        keep = min(base_len, k_tokens)
+        q_tokens = int(img_len * t)
+        mask = torch.zeros((q_tokens, k_tokens), dtype=torch.bool, device=context.device)
+        mask[:, :keep] = True
+        return mask
+
+    @staticmethod
     def _prepare_regional_context(context: torch.Tensor, transformer_options: Dict[str, Any]) -> torch.Tensor:
         attn_mask_obj = transformer_options.get("AttnMask")
         attn_mask_neg_obj = transformer_options.get("AttnMask_neg")
@@ -1143,8 +1171,16 @@ class ReAnimaPatcherAdvanced:
         weight_neg = _scalar_or_default(transformer_options.get("regional_conditioning_weight_neg"), 0.0)
         cond_or_uncond = transformer_options.get("cond_or_uncond")
 
-        if attn_mask_obj is None or weight == 0.0:
+        if attn_mask_obj is None:
             transformer_options.pop("_res4lyf_anima_attn_mask", None)
+            return context
+
+        if weight == 0.0:
+            base_mask = ReAnimaPatcherAdvanced._build_base_token_mask(attn_mask_obj, context)
+            if base_mask is not None:
+                transformer_options["_res4lyf_anima_attn_mask"] = base_mask
+            else:
+                transformer_options.pop("_res4lyf_anima_attn_mask", None)
             return context
 
         attn_mask_obj.attn_mask_recast(context.dtype)
