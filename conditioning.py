@@ -1839,10 +1839,12 @@ def merge_with_base(
         zero_tokens = torch.zeros_like(base_tokens)
         toks = [zero_tokens]
 
-        # zero-out any tensor fields in base_info
+        # Zero-out floating tensor fields in base_info. Keep integer/bool tensors
+        # untouched so token-id style metadata is not numerically merged.
         for key, val in base_info.items():
             if isinstance(val, torch.Tensor):
-                base_info[key] = torch.zeros_like(val)
+                if torch.is_floating_point(val) or torch.is_complex(val):
+                    base_info[key] = torch.zeros_like(val)
 
         # collect same-level tokens from each other
         for pos in others:
@@ -1857,6 +1859,21 @@ def merge_with_base(
         for key, val in list(base_info.items()):
             if not isinstance(val, torch.Tensor):
                 continue
+
+            # Integer/bool metadata tensors (e.g. token ids) should not be
+            # summed across regions. Preserve the first available source tensor.
+            if not (torch.is_floating_point(val) or torch.is_complex(val)):
+                source_tensor = None
+                for pos in others:
+                    if lvl < len(pos):
+                        info_i = pos[lvl][1]
+                        if key in info_i and isinstance(info_i[key], torch.Tensor):
+                            source_tensor = info_i[key]
+                            break
+                if source_tensor is not None:
+                    base[lvl][1][key] = source_tensor
+                continue
+
             pieces = [val]  # zeroed base tensor
             for pos in others:
                 if lvl < len(pos):
