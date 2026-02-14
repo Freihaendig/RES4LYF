@@ -1152,29 +1152,35 @@ class ReAnimaPatcherAdvanced:
             return None
 
         k_tokens = context.shape[1]
+        base_start_hint = None
         base_len_hint = None
         if transformer_options is not None:
+            base_start_hint = transformer_options.get("_res4lyf_anima_base_context_start")
             base_len_hint = transformer_options.get("_res4lyf_anima_base_context_len")
 
-        if base_len_hint is None:
-            context_lens = getattr(attn_mask_obj, "context_lens", None)
-            if context_lens:
-                try:
-                    base_len_hint = max(int(v) for v in context_lens if int(v) > 0)
-                except Exception:
-                    base_len_hint = None
+        try:
+            start = int(base_start_hint) if base_start_hint is not None else 0
+        except Exception:
+            start = 0
+        start = min(max(start, 0), k_tokens)
 
-        if base_len_hint is None:
-            keep = k_tokens
+        try:
+            span_len = int(base_len_hint) if base_len_hint is not None else 0
+        except Exception:
+            span_len = 0
+
+        if span_len <= 0:
+            start = 0
+            end = k_tokens
         else:
-            try:
-                keep = min(max(int(base_len_hint), 1), k_tokens)
-            except Exception:
-                keep = k_tokens
+            end = min(start + max(span_len, 1), k_tokens)
+            if end <= start:
+                start = 0
+                end = k_tokens
 
         q_tokens = int(img_len * t)
         mask = torch.zeros((q_tokens, k_tokens), dtype=torch.bool, device=context.device)
-        mask[:, :keep] = True
+        mask[:, start:end] = True
         return mask
 
     @staticmethod
@@ -1237,7 +1243,17 @@ class ReAnimaPatcherAdvanced:
             transformer_options = {}
             kwargs["transformer_options"] = transformer_options
 
-        base_context_len = kwargs.get("anima_base_context_len")
+        base_context_start = kwargs.pop("anima_base_context_start", None)
+        base_context_len = kwargs.pop("anima_base_context_len", None)
+
+        if base_context_start is None:
+            transformer_options.pop("_res4lyf_anima_base_context_start", None)
+        else:
+            try:
+                transformer_options["_res4lyf_anima_base_context_start"] = int(base_context_start)
+            except Exception:
+                transformer_options.pop("_res4lyf_anima_base_context_start", None)
+
         if base_context_len is None:
             transformer_options.pop("_res4lyf_anima_base_context_len", None)
         else:

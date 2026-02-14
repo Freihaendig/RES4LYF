@@ -68,14 +68,33 @@ def _concat_anima_conditioning_tokens(cond, cond_list):
     cond[0] = (torch.cat(token_tensors, dim=-2), info)
 
 
-def _set_anima_base_context_len(cond, base_cond):
+def _set_anima_base_context_span(cond, cond_list, base_index=-1):
     if not cond or not _is_conditioning_shape(cond):
         return
-    if not base_cond or not _is_conditioning_shape(base_cond):
+    if not isinstance(cond_list, (list, tuple)) or len(cond_list) == 0:
         return
-    if not isinstance(base_cond[0][0], torch.Tensor):
+
+    lengths = []
+    for c in cond_list:
+        if not c or not _is_conditioning_shape(c):
+            return
+        if not isinstance(c[0][0], torch.Tensor):
+            return
+        lengths.append(int(c[0][0].shape[-2]))
+
+    if len(lengths) == 0:
         return
-    cond[0][1]["anima_base_context_len"] = int(base_cond[0][0].shape[-2])
+
+    idx = int(base_index)
+    if idx < 0:
+        idx += len(lengths)
+    if idx < 0 or idx >= len(lengths):
+        return
+
+    start = int(sum(lengths[:idx]))
+    span_len = int(lengths[idx])
+    cond[0][1]["anima_base_context_start"] = start
+    cond[0][1]["anima_base_context_len"] = span_len
 
 
 def _is_conditioning_shape(cond):
@@ -1321,7 +1340,7 @@ class ClownRegionalConditioning_AB:
             if _is_anima_model(model):
                 _concat_anima_conditioning_tokens(cond, [conditioning_A, conditioning_B])
                 _merge_anima_text_metadata(cond, [conditioning_A, conditioning_B])
-                _set_anima_base_context_len(cond, conditioning_B)
+                _set_anima_base_context_span(cond, [conditioning_A, conditioning_B], base_index=1)
             else:
                 cond = merge_with_base(base=cond, others=[conditioning_A, conditioning_B])
             
@@ -1565,7 +1584,7 @@ class ClownRegionalConditioning_ABC:
             if _is_anima_model(model):
                 _concat_anima_conditioning_tokens(conditioning, [conditioning_A, conditioning_B, conditioning_C])
                 _merge_anima_text_metadata(conditioning, [conditioning_A, conditioning_B, conditioning_C])
-                _set_anima_base_context_len(conditioning, conditioning_C)
+                _set_anima_base_context_span(conditioning, [conditioning_A, conditioning_B, conditioning_C], base_index=2)
             else:
                 conditioning = merge_with_base(base=conditioning, others=[conditioning_A, conditioning_B, conditioning_C])
             
@@ -1886,7 +1905,7 @@ class ClownRegionalConditionings:
         if _is_anima_model(model):
             _concat_anima_conditioning_tokens(conditioning, cond_list)
             _merge_anima_text_metadata(conditioning, cond_list)
-            _set_anima_base_context_len(conditioning, cond_list[-1] if len(cond_list) > 0 else conditioning)
+            _set_anima_base_context_span(conditioning, cond_list, base_index=len(cond_list)-1)
         else:
             conditioning = merge_with_base(base=conditioning, others=cond_list)
         
