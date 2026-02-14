@@ -185,23 +185,31 @@ def _anima_attention_op(q, k, v, transformer_options=None, attn_kind="cross", fa
             transformer_options=transformer_options,
         )
 
-    if mask.dtype != torch.bool:
-        mask = mask > 0
-
-    # Avoid all-false rows, which produce undefined attention output.
-    row_ok = mask.any(dim=-1, keepdim=True)
-    if not torch.all(row_ok):
-        mask = torch.where(row_ok, mask, torch.ones_like(mask))
-
-    # Build additive bias mask explicitly to avoid bool-mask semantic
-    # ambiguity and keep backend behavior deterministic.
     q_dtype = q_attn.dtype if q_attn.dtype.is_floating_point else torch.float32
-    neg_inf = torch.finfo(q_dtype).min
-    mask_bias = torch.where(
-        mask.to(device=q_attn.device),
-        torch.zeros_like(mask, dtype=q_dtype, device=q_attn.device),
-        torch.full_like(mask, neg_inf, dtype=q_dtype, device=q_attn.device),
-    )
+    mask_device = q_attn.device
+
+    # Preserve soft regional mask strengths (gradient masks) instead of
+    # collapsing everything to bool. This lets regional weight/floor schedules
+    # affect Anima similarly to other model integrations.
+    if mask.dtype == torch.bool:
+        allow = mask.to(device=mask_device, dtype=q_dtype)
+    else:
+        allow = torch.clamp(mask.to(device=mask_device, dtype=q_dtype), 0.0, 1.0)
+
+    weight = abs(_scalar_or_default(transformer_options.get("regional_conditioning_weight"), 1.0))
+    floor = abs(_scalar_or_default(transformer_options.get("regional_conditioning_floor"), 0.0))
+    weight = min(max(weight, 0.0), 1.0)
+    floor = min(max(floor, 0.0), 1.0)
+
+    # Floor opens a baseline attention path ("bleed"), then weight controls
+    # how strongly we pull toward regional masking vs fully-open attention.
+    allow = floor + (1.0 - floor) * allow
+    allow = 1.0 - weight * (1.0 - allow)
+    allow = torch.clamp(allow, 1e-6, 1.0)
+
+    mask_strength = abs(_scalar_or_default(transformer_options.get("_res4lyf_anima_mask_strength"), 4.0))
+    mask_strength = max(mask_strength, 1.0)
+    mask_bias = torch.log(allow) * mask_strength
 
     # Blackwell + xformers currently fails when passing tensor attn_bias.
     # Force PyTorch SDPA path for masked regional attention.
@@ -1221,12 +1229,10 @@ class ReAnimaPatcherAdvanced:
 
             if any(mask is not None for mask in mixed_masks):
                 ref_mask = next(mask for mask in mixed_masks if mask is not None)
-                full_mask = torch.ones_like(ref_mask, dtype=torch.bool, device=ref_mask.device)
+                full_mask = torch.ones_like(ref_mask, dtype=ref_mask.dtype, device=ref_mask.device)
                 stacked = []
                 for mask in mixed_masks:
                     curr = full_mask if mask is None else mask
-                    if curr.dtype != torch.bool:
-                        curr = curr > 0
                     stacked.append(curr)
                 transformer_options["_res4lyf_anima_attn_mask"] = torch.stack(stacked, dim=0)
             else:
