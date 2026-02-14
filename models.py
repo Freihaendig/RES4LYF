@@ -1335,6 +1335,70 @@ class ReAnimaPatcherAdvanced:
         context = ReAnimaPatcherAdvanced._prepare_regional_context(context, transformer_options)
         return ReAnimaPatcherAdvanced.original_forward(self, x, timesteps, context, fps, padding_mask, **kwargs)
 
+    @staticmethod
+    def _make_regional_preprocess(diffusion_model, original_preprocess):
+        """Return a replacement for ``preprocess_text_embeds`` that injects a
+        block-diagonal attention mask into the LLM adapter so that each
+        region's tokens can only attend to tokens from the same region during
+        the 6-layer adapter forward pass.
+
+        Without this, the adapter's fully-unmasked self-attention mixes ALL
+        regional tokens together, destroying the regional separation that the
+        later cross-attention mask relies on.
+        """
+        import torch.nn.functional as _F
+
+        def _preprocess(text_embeds, text_ids, t5xxl_weights=None):
+            splits = getattr(diffusion_model, '_res4lyf_anima_region_splits', None)
+
+            if splits is None or len(splits) <= 1:
+                return original_preprocess(text_embeds, text_ids, t5xxl_weights)
+
+            total_len = sum(splits)
+            embed_len = text_embeds.shape[1] if text_embeds is not None else 0
+            ids_len = text_ids.shape[-1] if text_ids is not None else 0
+
+            # Only apply when the concatenated lengths actually match what we
+            # expect from the budget allocation.  Fall back gracefully.
+            if total_len <= 0 or total_len != embed_len or total_len != ids_len:
+                return original_preprocess(text_embeds, text_ids, t5xxl_weights)
+
+            # ── Build block-diagonal bool mask ────────────────────────────
+            # True = attend, False = block.  Each region can only attend
+            # to its own positions in self-attention, and to its own source
+            # tokens in cross-attention.
+            device = text_embeds.device
+            self_mask = torch.zeros(total_len, total_len, dtype=torch.bool, device=device)
+            start = 0
+            for length in splits:
+                if length > 0:
+                    self_mask[start:start + length, start:start + length] = True
+                start += length
+
+            # LLMAdapter expands 2-D masks to [1, 1, S, S] internally.
+            # Use the same mask for both self-attn (target_attention_mask)
+            # and cross-attn (source_attention_mask) since both source and
+            # target share the same per-region token layout.
+            out = diffusion_model.llm_adapter(
+                text_embeds,
+                text_ids,
+                target_attention_mask=self_mask,
+                source_attention_mask=self_mask,
+            )
+            if t5xxl_weights is not None:
+                t5xxl_weights_expanded = t5xxl_weights
+                if t5xxl_weights_expanded.ndim == 1:
+                    t5xxl_weights_expanded = t5xxl_weights_expanded.unsqueeze(0).unsqueeze(-1)
+                elif t5xxl_weights_expanded.ndim == 2:
+                    t5xxl_weights_expanded = t5xxl_weights_expanded.unsqueeze(-1)
+                out = out * t5xxl_weights_expanded.to(out)
+
+            if out.shape[1] < 512:
+                out = _F.pad(out, (0, 0, 0, 512 - out.shape[1]))
+            return out
+
+        return _preprocess
+
     def main(self, model, enable=True, force=False):
         if not self._supports_anima(model):
             raise ValueError("This node is for enabling regional conditioning for Anima only!")
@@ -1362,6 +1426,21 @@ class ReAnimaPatcherAdvanced:
                         "cross",
                         block.cross_attn._res4lyf_original_attn_op,
                     )
+
+            # ── Patch preprocess_text_embeds to inject block-diagonal mask ────
+            # The LLM adapter has 6 layers of fully-unmasked self-attention that
+            # mix ALL regional tokens together, destroying regional separation
+            # before the main model's cross-attention ever sees the context.
+            # By injecting a block-diagonal mask into the adapter's self-attention
+            # (and cross-attention), each region's tokens only attend to their own
+            # region, preserving regional separation through the adapter.
+            if hasattr(diffusion_model, 'llm_adapter'):
+                if not hasattr(diffusion_model, '_res4lyf_original_preprocess_text_embeds'):
+                    diffusion_model._res4lyf_original_preprocess_text_embeds = diffusion_model.preprocess_text_embeds
+                diffusion_model.preprocess_text_embeds = ReAnimaPatcherAdvanced._make_regional_preprocess(
+                    diffusion_model,
+                    diffusion_model._res4lyf_original_preprocess_text_embeds,
+                )
         else:
             diffusion_model._res4lyf_anima_regional_enabled = False
             if ReAnimaPatcherAdvanced.original_forward is not None:
@@ -1374,6 +1453,10 @@ class ReAnimaPatcherAdvanced:
                     block.cross_attn.attn_op = block.cross_attn._res4lyf_original_attn_op
 
             diffusion_model._res4lyf_anima_attn_mask = None
+            diffusion_model._res4lyf_anima_region_splits = None
+
+            if hasattr(diffusion_model, '_res4lyf_original_preprocess_text_embeds'):
+                diffusion_model.preprocess_text_embeds = diffusion_model._res4lyf_original_preprocess_text_embeds
 
         return (m,)
 

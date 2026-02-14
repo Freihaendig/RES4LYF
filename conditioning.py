@@ -395,6 +395,11 @@ def _merge_anima_conditionings(cond, cond_list, base_index=-1):
         except Exception:
             pass
 
+    # Store the per-region split lengths so the adapter can build a
+    # block-diagonal self-attention mask to prevent cross-region mixing.
+    if isinstance(info, dict):
+        info["_anima_region_splits"] = [int(v) for v in keep]
+
     return keep
 
 
@@ -1658,6 +1663,12 @@ class ClownRegionalConditioning_AB:
                     base_min_tokens=anima_base_min_tokens,
                 )
                 _merge_anima_conditionings(cond, [conditioning_A, conditioning_B], base_index=1)
+                # Store region splits on the diffusion model so the patched
+                # preprocess_text_embeds can inject a block-diagonal mask into
+                # the LLM adapter's self-attention.
+                splits = cond[0][1].get("_anima_region_splits")
+                if splits is not None and hasattr(model, 'model') and hasattr(model.model, 'diffusion_model'):
+                    model.model.diffusion_model._res4lyf_anima_region_splits = splits
             else:
                 cond = merge_with_base(base=cond, others=[conditioning_A, conditioning_B])
             
@@ -1921,6 +1932,9 @@ class ClownRegionalConditioning_ABC:
                     base_min_tokens=anima_base_min_tokens,
                 )
                 _merge_anima_conditionings(conditioning, [conditioning_A, conditioning_B, conditioning_C], base_index=2)
+                splits = conditioning[0][1].get("_anima_region_splits")
+                if splits is not None and hasattr(model, 'model') and hasattr(model.model, 'diffusion_model'):
+                    model.model.diffusion_model._res4lyf_anima_region_splits = splits
             else:
                 conditioning = merge_with_base(base=conditioning, others=[conditioning_A, conditioning_B, conditioning_C])
             
@@ -2268,6 +2282,9 @@ class ClownRegionalConditionings:
             )
             base_index = _guess_anima_base_index_from_masks(mask_list, fallback=len(cond_list) - 1)
             _merge_anima_conditionings(conditioning, cond_list, base_index=base_index)
+            splits = conditioning[0][1].get("_anima_region_splits")
+            if splits is not None and hasattr(model, 'model') and hasattr(model.model, 'diffusion_model'):
+                model.model.diffusion_model._res4lyf_anima_region_splits = splits
         else:
             conditioning = merge_with_base(base=conditioning, others=cond_list)
         
