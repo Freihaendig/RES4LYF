@@ -120,6 +120,27 @@ def _read_anima_env_int_optional(info: dict, key: str, env_key: str) -> Optional
         return None
 
 
+def _guess_anima_base_index_from_masks(mask_list: List[torch.Tensor], fallback: int) -> int:
+    if not isinstance(mask_list, (list, tuple)) or len(mask_list) == 0:
+        return int(fallback)
+
+    for idx, mask in enumerate(mask_list):
+        if not isinstance(mask, torch.Tensor) or mask.numel() == 0:
+            continue
+        try:
+            if mask.dtype == torch.bool:
+                if bool(mask.all().item()):
+                    return int(idx)
+            else:
+                coverage = float(torch.clamp(mask, 0.0, 1.0).mean().item())
+                if coverage >= 0.999:
+                    return int(idx)
+        except Exception:
+            continue
+
+    return int(fallback)
+
+
 def _allocate_anima_budget(lengths: List[int], budget: int, base_index: int, min_region: int, base_min: int) -> List[int]:
     lengths = [max(int(v), 0) for v in lengths]
     n = len(lengths)
@@ -135,6 +156,15 @@ def _allocate_anima_budget(lengths: List[int], budget: int, base_index: int, min
 
     alloc = [0] * n
     active = [i for i, l in enumerate(lengths) if l > 0]
+
+    # Cap per-region minimum so it cannot exceed the total available budget.
+    # This prevents tight budgets (e.g. small Anima context caps) from
+    # immediately collapsing to a single region due to min_region > budget/N.
+    if len(active) > 0 and min_region > 0:
+        if budget >= len(active):
+            min_region = min(int(min_region), int(budget // len(active)))
+        else:
+            min_region = 0
     for i in active:
         alloc[i] = min(lengths[i], max(min_region, 0))
 
@@ -268,7 +298,11 @@ def _merge_anima_conditionings(cond, cond_list, base_index=-1):
         cond[0][1]["anima_context_len_raw"] = int(sum(lengths))
         cond[0][1]["anima_context_len_used"] = int(sum(lengths))
         RESplain("Anima regional token budgeting disabled (legacy concat path).", "warning")
-        return
+        try:
+            keep = [int(c[0][0].shape[-2]) for c in cond_list if c and _is_conditioning_shape(c)]
+        except Exception:
+            keep = []
+        return keep
 
     # Treat explicit zero as "use inferred safe default", not "disable".
     if token_budget == 0:
@@ -323,6 +357,23 @@ def _merge_anima_conditionings(cond, cond_list, base_index=-1):
             "Anima regional base context received 0 tokens after budgeting; increase token budget or lower per-region minimum.",
             "warning",
         )
+
+    # Ensure regional attention masks match the post-budget context token layout.
+    # AttnMask is built from per-region conditioning lengths, so if we truncate
+    # token sequences here we must also update those lengths before mask
+    # generation happens in the sampler.
+    attn_mask_obj = info.get("AttnMask") if isinstance(info, dict) else None
+    if attn_mask_obj is not None and hasattr(attn_mask_obj, "context_lens"):
+        try:
+            original = list(getattr(attn_mask_obj, "context_lens") or [])
+            if len(original) == len(keep) and sum(original) != sum(keep):
+                attn_mask_obj.context_lens = [int(v) for v in keep]
+                attn_mask_obj.text_len = int(sum(attn_mask_obj.context_lens))
+                attn_mask_obj.text_off = int(attn_mask_obj.text_len)
+        except Exception:
+            pass
+
+    return keep
 
 
 def _is_conditioning_shape(cond):
@@ -2133,13 +2184,14 @@ class ClownRegionalConditionings:
         conditioning[0][1]['RegParam']   = RegionalParameters(weights, floors)
         
         if _is_anima_model(model):
-            _merge_anima_conditionings(conditioning, cond_list, base_index=len(cond_list)-1)
+            base_index = _guess_anima_base_index_from_masks(mask_list, fallback=len(cond_list) - 1)
+            _merge_anima_conditionings(conditioning, cond_list, base_index=base_index)
         else:
             conditioning = merge_with_base(base=conditioning, others=cond_list)
         
         if 'pooled_output' in conditioning[0][1] and conditioning[0][1]['pooled_output'] is not None:
             if _is_anima_model(model):
-                conditioning[0][1]['pooled_output'] = cond_list[-1][0][1]['pooled_output']
+                conditioning[0][1]['pooled_output'] = cond_list[base_index][0][1]['pooled_output']
             else:
                 conditioning[0][1]['pooled_output'] = torch.stack([cond_tmp[0][1]['pooled_output'] for cond_tmp in cond_list]).mean(dim=0)
 
