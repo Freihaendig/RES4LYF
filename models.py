@@ -99,16 +99,23 @@ def _extract_anima_cross_attn_mask(mask: Optional[torch.Tensor], text_len: int, 
     the last dimension.  Taking ``mask[:, :k_tokens]`` when k_tokens > text_len
     would leak self-attention values into cross-attention positions, corrupting
     the regional conditioning signal.  This helper avoids that by slicing to
-    ``text_len`` first, then zero-padding to ``k_tokens``."""
+    ``text_len`` first, then padding to ``k_tokens`` with ones (allow).
+
+    The padding columns correspond to zero-vector tokens added by Anima's LLM
+    adapter (``preprocess_text_embeds`` pads to 512).  The model was trained
+    with full attention to all 512 positions including padding, so we must
+    NOT block them — use ones so every image token can still attend to padding
+    tokens normally.  Only the real text-token columns carry regional masking."""
     if mask is None or text_len <= 0:
         return None
     cross = mask[..., :text_len]                    # only genuine cross-attn cols
     if cross.shape[-1] >= k_tokens:
         return cross[..., :k_tokens]                # trim if context shrank
-    # pad remaining columns (adapter padding tokens) with zeros → blocked
+    # pad remaining columns (adapter padding tokens) with ones → allow attention
+    # The model expects full access to zero-padded context positions.
     pad_cols = k_tokens - cross.shape[-1]
     pad_shape = list(cross.shape[:-1]) + [pad_cols]
-    pad = torch.zeros(*pad_shape, dtype=cross.dtype, device=cross.device)
+    pad = torch.ones(*pad_shape, dtype=cross.dtype, device=cross.device)
     return torch.cat([cross, pad], dim=-1)
 
 
@@ -146,10 +153,11 @@ def _slice_anima_mask_for_attention(mask: Optional[torch.Tensor], q_tokens: int,
     if sliced is not None and sliced.shape[-2] == q_tokens and sliced.shape[-1] < k_tokens:
         # Anima text preprocessing can pad context length (e.g. to 512 tokens).
         # Regional masks are built from pre-pad token lengths; pad mask columns
-        # so masking still applies instead of falling back to unmasked attention.
+        # with ones (allow) so image tokens can still attend to adapter-padding
+        # positions as the model was trained to expect.
         pad_cols = k_tokens - sliced.shape[-1]
         pad_shape = list(sliced.shape[:-1]) + [pad_cols]
-        pad = torch.zeros(*pad_shape, dtype=sliced.dtype, device=sliced.device)
+        pad = torch.ones(*pad_shape, dtype=sliced.dtype, device=sliced.device)
         sliced = torch.cat([sliced, pad], dim=-1)
 
     if sliced is None or sliced.shape[-2] != q_tokens or sliced.shape[-1] != k_tokens:
