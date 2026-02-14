@@ -173,79 +173,92 @@ def _reshape_anima_qkv_for_attention(t: torch.Tensor) -> torch.Tensor:
 
 
 def _anima_attention_op(q, k, v, transformer_options=None, attn_kind="cross", fallback_attn_op=None):
+    """Regional cross-attention op for Anima (WAN/Flux-style block-level masking).
+
+    Instead of applying a continuous log-bias to ALL transformer blocks (which
+    degrades image quality even at mild weight values), this uses the same
+    strategy as the WAN and Flux integrations:
+
+    * ``weight`` (regional_conditioning_weight) controls what **fraction of
+      blocks** receive hard bool masking.  weight=0.35 → the first 35 % of
+      blocks get masking, the rest run completely unmasked.
+    * Active blocks receive a **bool mask** passed directly to PyTorch SDPA
+      (True = attend, False = block with -inf).
+    * Inactive blocks fall through to the original attention op unchanged.
+
+    A per-block counter stored in ``transformer_options`` tracks which block
+    is currently executing.  It is reset to 0 at the start of each forward
+    pass in ``_forward_with_regional``.
+    """
     if transformer_options is None:
         transformer_options = {}
 
-    # For Anima, regional masking on cross-attention is the stable path.
-    # Self-attention masking can collapse output quality into noise.
-    if attn_kind != "cross":
+    def _run_fallback():
+        """Unmasked attention — either the original attn_op or comfy default."""
         if fallback_attn_op is not None:
             return fallback_attn_op(q, k, v, transformer_options=transformer_options)
-
-        q_attn = _reshape_anima_qkv_for_attention(q)
-        k_attn = _reshape_anima_qkv_for_attention(k)
-        v_attn = _reshape_anima_qkv_for_attention(v)
+        q_a = _reshape_anima_qkv_for_attention(q)
+        k_a = _reshape_anima_qkv_for_attention(k)
+        v_a = _reshape_anima_qkv_for_attention(v)
         return comfy_optimized_attention(
-            q_attn,
-            k_attn,
-            v_attn,
-            q_attn.shape[1],
+            q_a, k_a, v_a, q_a.shape[1],
             skip_reshape=True,
             transformer_options=transformer_options,
         )
 
+    # ── Self-attention: never apply regional masking ──────────────────────
+    if attn_kind != "cross":
+        return _run_fallback()
+
+    # ── No mask stored → nothing to do ────────────────────────────────────
+    mask = transformer_options.get("_res4lyf_anima_attn_mask")
+    if mask is None:
+        return _run_fallback()
+
+    # ── Block-level weight gate (WAN / Flux approach) ─────────────────────
+    # Increment counter FIRST so every cross-attn call is counted regardless
+    # of whether masking is applied.
+    counter_key = "_res4lyf_anima_block_counter"
+    block_idx = transformer_options.get(counter_key, 0)
+    transformer_options[counter_key] = block_idx + 1
+
+    total_blocks = transformer_options.get("_res4lyf_anima_total_blocks", 1)
+    weight = abs(_scalar_or_default(
+        transformer_options.get("regional_conditioning_weight"), 0.0,
+    ))
+    weight = min(max(weight, 0.0), 1.0)
+
+    # block_frac ∈ [0, 1] — position of this block in the stack.
+    # When weight < block_frac the block runs unmasked (same logic as WAN).
+    block_frac = block_idx / max(total_blocks - 1, 1)
+    if weight < block_frac:
+        return _run_fallback()
+
+    # ── Reshape for attention ─────────────────────────────────────────────
     q_attn = _reshape_anima_qkv_for_attention(q)
     k_attn = _reshape_anima_qkv_for_attention(k)
     v_attn = _reshape_anima_qkv_for_attention(v)
 
-    mask = transformer_options.get("_res4lyf_anima_attn_mask")
-    mask = _slice_anima_mask_for_attention(mask, q_attn.shape[2], k_attn.shape[2], attn_kind)
-
-    if mask is None:
-        if fallback_attn_op is not None:
-            return fallback_attn_op(q, k, v, transformer_options=transformer_options)
+    mask_sliced = _slice_anima_mask_for_attention(
+        mask, q_attn.shape[2], k_attn.shape[2], attn_kind,
+    )
+    if mask_sliced is None:
         return comfy_optimized_attention(
-            q_attn,
-            k_attn,
-            v_attn,
-            q_attn.shape[1],
+            q_attn, k_attn, v_attn, q_attn.shape[1],
             skip_reshape=True,
             transformer_options=transformer_options,
         )
 
-    q_dtype = q_attn.dtype if q_attn.dtype.is_floating_point else torch.float32
-    mask_device = q_attn.device
+    # ── Convert to bool mask for direct SDPA usage ────────────────────────
+    # SDPA convention: True = attend, False = blocked (-inf).
+    # SplitAttentionMask already uses this convention (1/True = attend).
+    if mask_sliced.dtype != torch.bool:
+        mask_sliced = mask_sliced > 0.5
 
-    # Preserve soft regional mask strengths (gradient masks) instead of
-    # collapsing everything to bool. This lets regional weight/floor schedules
-    # affect Anima similarly to other model integrations.
-    if mask.dtype == torch.bool:
-        allow = mask.to(device=mask_device, dtype=q_dtype)
-    else:
-        allow = torch.clamp(mask.to(device=mask_device, dtype=q_dtype), 0.0, 1.0)
-
-    weight = abs(_scalar_or_default(transformer_options.get("regional_conditioning_weight"), 1.0))
-    floor = abs(_scalar_or_default(transformer_options.get("regional_conditioning_floor"), 0.0))
-    weight = min(max(weight, 0.0), 1.0)
-    floor = min(max(floor, 0.0), 1.0)
-
-    # Blend toward unmasked attention as weight approaches zero.
-    allow = floor + (1.0 - floor) * allow
-    allow = 1.0 - weight * (1.0 - allow)
-    allow = torch.clamp(allow, 1e-6, 1.0)
-
-    mask_strength = abs(_scalar_or_default(transformer_options.get("_res4lyf_anima_mask_strength"), 4.0))
-    mask_strength = max(mask_strength, 1.0)
-    mask_bias = torch.log(allow) * mask_strength
-
-    # Blackwell + xformers currently fails when passing tensor attn_bias.
-    # Force PyTorch SDPA path for masked regional attention.
     return comfy_attention_pytorch(
-        q_attn,
-        k_attn,
-        v_attn,
+        q_attn, k_attn, v_attn,
         q_attn.shape[1],
-        mask=mask_bias,
+        mask=mask_sliced,
         skip_reshape=True,
         transformer_options=transformer_options,
     )
@@ -1238,7 +1251,10 @@ class ReAnimaPatcherAdvanced:
         attn_mask_pos = None
         if attn_mask_obj is not None and weight != 0.0:
             attn_mask_obj.attn_mask_recast(context.dtype)
-            raw_mask = attn_mask_obj.get(weight=weight)
+            # weight=1.0: get raw unscaled mask.  `weight` now controls which
+            # fraction of transformer blocks receive masking (block-level gate),
+            # NOT the mask intensity.
+            raw_mask = attn_mask_obj.get(weight=1.0)
             text_len = getattr(attn_mask_obj, "text_len", 0)
             if text_len > 0 and raw_mask is not None and raw_mask.shape[-1] != k_tokens:
                 attn_mask_pos = _extract_anima_cross_attn_mask(raw_mask, text_len, k_tokens)
@@ -1250,7 +1266,7 @@ class ReAnimaPatcherAdvanced:
         attn_mask_neg = None
         if attn_mask_neg_obj is not None and weight_neg != 0.0:
             attn_mask_neg_obj.attn_mask_recast(context.dtype)
-            raw_mask_neg = attn_mask_neg_obj.get(weight=weight_neg)
+            raw_mask_neg = attn_mask_neg_obj.get(weight=1.0)
             text_len_neg = getattr(attn_mask_neg_obj, "text_len", 0)
             if text_len_neg > 0 and raw_mask_neg is not None and raw_mask_neg.shape[-1] != k_tokens:
                 attn_mask_neg = _extract_anima_cross_attn_mask(raw_mask_neg, text_len_neg, k_tokens)
@@ -1310,6 +1326,11 @@ class ReAnimaPatcherAdvanced:
                 transformer_options["_res4lyf_anima_base_context_len"] = int(base_context_len)
             except Exception:
                 transformer_options.pop("_res4lyf_anima_base_context_len", None)
+
+        # Block-level masking: tell the attention op how many blocks exist and
+        # reset the per-block counter so it increments 0 → N during this pass.
+        transformer_options["_res4lyf_anima_total_blocks"] = len(self.blocks)
+        transformer_options["_res4lyf_anima_block_counter"] = 0
 
         context = ReAnimaPatcherAdvanced._prepare_regional_context(context, transformer_options)
         return ReAnimaPatcherAdvanced.original_forward(self, x, timesteps, context, fps, padding_mask, **kwargs)
