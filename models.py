@@ -138,6 +138,24 @@ def _anima_attention_op(q, k, v, transformer_options=None, attn_kind="cross", fa
     if transformer_options is None:
         transformer_options = {}
 
+    # For Anima, regional masking on cross-attention is the stable path.
+    # Self-attention masking can collapse output quality into noise.
+    if attn_kind != "cross":
+        if fallback_attn_op is not None:
+            return fallback_attn_op(q, k, v, transformer_options=transformer_options)
+
+        q_attn = _reshape_anima_qkv_for_attention(q)
+        k_attn = _reshape_anima_qkv_for_attention(k)
+        v_attn = _reshape_anima_qkv_for_attention(v)
+        return comfy_optimized_attention(
+            q_attn,
+            k_attn,
+            v_attn,
+            q_attn.shape[1],
+            skip_reshape=True,
+            transformer_options=transformer_options,
+        )
+
     q_attn = _reshape_anima_qkv_for_attention(q)
     k_attn = _reshape_anima_qkv_for_attention(k)
     v_attn = _reshape_anima_qkv_for_attention(v)
